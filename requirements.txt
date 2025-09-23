@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+requests
+sqlalchemy
+alembic
+pydantic
+python-dotenv
+spacy
+rapidfuzz
+nltk
+pytest
+httpx

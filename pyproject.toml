@@ -1,0 +1,5 @@
+[tool.poetry]
+name = 'ai-journalist-monitor'
+version = '0.0.1'
+description = 'Media monitoring MVP'
+authors = ['you <you@example.com>']
