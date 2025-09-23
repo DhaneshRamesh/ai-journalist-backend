@@ -1,13 +1,13 @@
-fastapi
-uvicorn[standard]
-requests
-sqlalchemy
-alembic
-pydantic
-python-dotenv
-spacy
-rapidfuzz
-nltk
-pytest
-httpx
-feedparser
+fastapi>=0.95.0
+uvicorn[standard]>=0.22.0
+requests>=2.31.0
+feedparser>=6.0.10
+sqlalchemy>=2.0.20
+pydantic>=1.10.11
+python-dotenv>=1.0.0
+beautifulsoup4>=4.12.2
+vaderSentiment>=3.3.3
+pytest>=7.4.0
+streamlit>=1.26.0
+# Dev / optional
+sqlite3
