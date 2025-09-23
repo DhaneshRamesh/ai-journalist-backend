@@ -201,21 +201,3 @@ G
 
 * Do **not** commit secrets (`.env`) or `dev.db`. Use `.env` and `.env.example` to note required credentials.
 * Journalist contact data (if collected later) must be handled per privacy laws and terms of use.
-
----
-
-## Checkpoint
-
-* The assistant has stored a checkpoint of the current project state (ingest + processing + API + 15 updated mentions). When you come back, mention the checkpoint name or ask to resume from the checkpoint.
-
----
-
-## Contact / next steps
-
-If you want I can:
-
-* write the **Streamlit demo** into `frontend/app.py` and give the run command, OR
-* implement the **journalist matcher** (TF-IDF + endpoint) — high-impact feature, OR
-* add **unit tests + GitHub Actions CI**.
-
-Tell me which and I’ll produce the exact file writes and commands.
