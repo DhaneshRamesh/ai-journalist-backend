@@ -10,3 +10,4 @@ rapidfuzz
 nltk
 pytest
 httpx
+feedparser
