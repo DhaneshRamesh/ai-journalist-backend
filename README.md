@@ -129,5 +129,3 @@ ai-journalist-monitor/
 * Deploy backend & frontend (Render / Azure Static Apps)
 
 ---
-
-Made with ❤️ for media monitoring and AI journalism research.
