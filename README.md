@@ -1,203 +1,133 @@
-# AI Journalist — Media Monitoring (MVP)
+# 📰 AI Journalist Monitor
 
-## Summary
-
-**AI Journalist** is a media monitoring MVP that ingests news (Google News RSS), stores articles, runs lightweight NLP to:
-
-* clean & summarize article text,
-* classify sentiment (VADER),
-* detect simple data-leak risk indicators (keyword heuristic),
-* store results as `mentions` linked to `articles`,
-* expose results via a FastAPI JSON API,
-* provide scripts to ingest/process/update mentions.
-
-This repo is intentionally modular and ready to extend (Streamlit dashboard, journalist matcher, alerts, OpenAI summariser, CI/tests).
+AI-powered pipeline to monitor media mentions, analyze sentiment/risk, and provide summaries — with both a FastAPI backend and a Streamlit dashboard frontend.
 
 ---
 
-## Quick status (checkpoint)
+## 🚀 Features
 
-**Done**
+* **Backend (FastAPI)**
 
-* Ingest from Google News RSS (`scripts/ingest_once.py`).
-* Articles saved to SQLite `dev.db` (`src/db/models.py` Article model).
-* Processing pipeline (`scripts/process_mentions.py`) producing `mentions` with summary, sentiment, risk.
-* Sentiment via `vaderSentiment` (robust; no NLTK downloads required).
-* Risk detection via keyword heuristic in `src/processing/risk_detector.py`.
-* Summaries cleaned (HTML stripped) in `src/processing/summarizer.py` using BeautifulSoup.
-* DB models include `Article` and `Mention` (SQLAlchemy).
-* API (FastAPI) exposing `/api/health` and `/api/mentions` (`src/api/app.py`, `src/api/endpoints.py`).
-* Update script to refresh existing mentions in-place: `scripts/update_mentions.py`.
-* `.gitignore` recommended (ignore `dev.db`, `.venv`, caches).
-* Checkpoint stored (project state saved to assistant memory).
+  * Ingests and stores mentions/articles
+  * Sentiment analysis & risk detection
+  * Summarization of long texts
+  * REST API for mentions, health check, etc.
+* **Frontend (Streamlit)**
 
-**Current live/dev data**
+  * Lists mentions in a simple dashboard
+  * Shows title, summary, sentiment, risk score
+  * Buttons for future actions (flagging, suggesting journalists)
+* **Scripts**
 
-* `dev.db` contains imported articles and 15 mentions processed and updated.
-
-**Left / Roadmap (recommendation order)**
-
-1. Add Streamlit demo dashboard (`frontend/app.py`) — *quick demo* and recommended next step.
-2. Journalist matcher (TF-IDF or embedding-based) using `examples/sample_journalists.csv` + `GET /api/journalists?article_id=...`.
-3. Replace summarizer with LLM (OpenAI/HF) for higher-quality summaries (needs API key, caching).
-4. Alerts: notify via email/Slack when `risk_score > 0` or negative sentiment.
-5. Tests & CI: unit tests for ingestion + processing + API + GitHub Actions.
-6. Alembic migrations for DB schema management (production readiness).
-7. Social media monitoring + rate-limited ingestion + dedup across sources.
-8. Journalist contact DB enrichment (profile + beats + contact method, consent & privacy checks).
+  * `process_mentions.py` → fetch & store mentions
+  * `update_mentions.py` → refresh sentiment/risk/summary
+  * `run_demo.py` → launches backend + frontend in two separate Terminal windows (local demo)
 
 ---
 
-## Repo layout (important files)
+## 📦 Installation
 
-```
-.
-├── docs/
-├── examples/                   # sample CSVs
-├── frontend/                   # optional: Streamlit app (create if needed)
-├── scripts/
-│   ├── ingest_once.py          # fetch RSS → articles (DB or CSV)
-│   ├── process_mentions.py     # create mentions from articles
-│   └── update_mentions.py      # reprocess/refresh existing mentions
-├── src/
-│   ├── api/
-│   │   ├── app.py
-│   │   └── endpoints.py
-│   ├── db/
-│   │   └── models.py
-│   ├── processing/
-│   │   ├── summarizer.py
-│   │   ├── sentiment.py
-│   │   └── risk_detector.py
-│   └── ...
-├── dev.db                      # local SQLite (ignored by git)
-├── requirements.txt
-└── README.md
-```
-
----
-
-## Quickstart (local development)
-
-Assumes you are at repo root (e.g. `/Users/you/Desktop/ai-journalist-monitor`).
-
-1. Create & activate virtualenv
+Clone this repository:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+git clone https://github.com/DhaneshRamesh/ai-journalist-monitor.git
+cd ai-journalist-monitor
 ```
 
-2. Install dependencies
+Install dependencies globally (Python 3.13+):
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Ingest articles (one-off)
+*(Or install manually: `pip install fastapi uvicorn sqlalchemy streamlit requests pandas`)*
+
+---
+
+## ▶️ Running Locally
+
+### Option 1: Manual
+
+Start backend:
 
 ```bash
-# ensures repo root is on PYTHONPATH so imports like `from src...` work
-PYTHONPATH=. python3 scripts/ingest_once.py
+uvicorn src.api.app:app --reload
 ```
 
-4. Process mentions (create mentions from articles)
+Start frontend (in another terminal):
 
 ```bash
-PYTHONPATH=. python3 scripts/process_mentions.py
+python3 -m streamlit run frontend/app.py
 ```
 
-5. Update mentions (recompute summaries/sentiment/risk in-place)
+### Option 2: Auto (recommended)
+
+Run both backend + frontend in separate macOS Terminal windows:
 
 ```bash
-PYTHONPATH=. python3 scripts/update_mentions.py
-```
-
-6. Run the API (in a separate terminal)
-
-```bash
-uvicorn src.api.app:app --reload --host 127.0.0.1 --port 8000
-# Health: http://127.0.0.1:8000/api/health
-# Mentions: http://127.0.0.1:8000/api/mentions
-```
-
-7. (Optional) Run Streamlit UI (if you add frontend/app.py)
-
-```bash
-pip install streamlit
-streamlit run frontend/app.py
-# open http://localhost:8501
+python3 scripts/run_demo.py
 ```
 
 ---
 
-## Important commands (dev & git)
+## 🔗 API Endpoints
 
-* Check DB counts:
+* **Health** → `GET /api/health`
+  Returns `{ "status": "ok" }`
 
-```bash
-sqlite3 dev.db "SELECT COUNT(*) FROM articles;"
-sqlite3 dev.db "SELECT COUNT(*) FROM mentions;"
-```
+* **Mentions** → `GET /api/mentions?limit=50`
+  Returns latest mentions with sentiment, summary, and risk score.
 
-* Inspect latest mentions:
+---
 
-```bash
-curl -s http://127.0.0.1:8000/api/mentions | jq .
-```
+## 💻 Frontend Dashboard
 
-* Git push to existing `develop` branch (if remote exists and branch present):
+* Lists all mentions from API
+* Displays title, summary, sentiment, risk score
+* Interactive buttons (Flag / Suggest Journalist) — demo placeholders
 
-```bash
-git add -A
-git commit -m "Update: AI Journalist Monitor codebase"
-git checkout develop
-git push origin develop
-```
-
-* Create `.gitignore` (recommended)
+Run it:
 
 ```bash
-cat > .gitignore <<'G'
-dev.db
-dev.db.backup
-.venv/
-__pycache__/
-*.pyc
-.DS_Store
-.env
-G
+python3 -m streamlit run frontend/app.py
 ```
 
 ---
 
-## Design & Implementation notes (for report)
+## 🗒️ Project Structure
 
-* **Ingestion**: Google News RSS search queries with localized params; `requests` + `feedparser` parsing. We set a browser `User-Agent` to avoid simple blocks.
-* **Storage**: SQLite for dev, SQLAlchemy ORM (Article & Mention models). Unique constraint on `link` prevents duplicates.
-* **Processing**:
-
-  * `summarizer.py`: BeautifulSoup to strip HTML and truncation fallback.
-  * `sentiment.py`: `vaderSentiment` for compound score → Positive/Neutral/Negative.
-  * `risk_detector.py`: keyword-based detection returning `risk_score` and hits.
-* **API**: FastAPI endpoints returning mention objects joined with article metadata. Pydantic response models ensure stable contract.
-* **Idempotency**: `process_mentions.py` checks for existing `Mention` by `article_id` and skips to avoid duplicates. `update_mentions.py` reprocesses safely in-place.
-
----
-
-## Grading / Demo checklist (what to show)
-
-1. Terminal: run `scripts/ingest_once.py` (ingest).
-2. Terminal: run `scripts/process_mentions.py` (process).
-3. Terminal: run `scripts/update_mentions.py` (optional refresh).
-4. Terminal: run `uvicorn ...` then `curl /api/mentions` and show JSON.
-5. Optional: run Streamlit dashboard and demonstrate filters + click-through.
-6. Explain the design and choices (summarizer choice, sentiment, risk heuristic, dedupe logic).
-7. Show tests/CI (if you add them) and next-step plans.
+```
+ai-journalist-monitor/
+├── src/
+│   ├── api/               # FastAPI app + endpoints
+│   ├── db/                # Database models & sessions
+│   └── processing/        # Sentiment, risk, summarizer
+├── frontend/              # Streamlit UI
+│   └── app.py
+├── scripts/               # CLI scripts
+│   ├── process_mentions.py
+│   ├── update_mentions.py
+│   └── run_demo.py
+└── README.md
+```
 
 ---
 
-## Security & privacy notes (for report)
+## ✅ Status
 
-* Do **not** commit secrets (`.env`) or `dev.db`. Use `.env` and `.env.example` to note required credentials.
-* Journalist contact data (if collected later) must be handled per privacy laws and terms of use.
+* Backend API working (`/api/health`, `/api/mentions`)
+* Processing pipeline creates & updates mentions
+* Frontend dashboard running
+* Demo script added to launch both services
+
+---
+
+## 📌 Next Steps
+
+* Add **journalist matching** logic
+* Enhance **risk scoring** heuristics
+* Deploy backend & frontend (Render / Azure Static Apps)
+
+---
+
+Made with ❤️ for media monitoring and AI journalism research.
