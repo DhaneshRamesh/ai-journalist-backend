@@ -10,12 +10,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-BACKEND_CMD = f"cd {REPO_ROOT} && python3 -m uvicorn src.api.app:app --reload --host 127.0.0.1 --port 8000"
-FRONTEND_CMD = f"cd {REPO_ROOT} && python3 -m streamlit run frontend/app.py"
+BACKEND_CMD = f"cd {REPO_ROOT} && uvicorn src.api.app:app --reload --host 127.0.0.1 --port 8000"
+FRONTEND_CMD = f"cd {REPO_ROOT} && streamlit run frontend/app.py"
 
 def open_in_terminal(command: str):
     """Run a shell command in a new Terminal.app window via AppleScript."""
-    # Escape quotes for AppleScript
     safe_cmd = command.replace('"', '\\"')
     apple_script = f'''
     tell application "Terminal"

@@ -1,4 +1,6 @@
 from fastapi import FastAPI
+from dotenv import load_dotenv
+load_dotenv()
 from fastapi.responses import RedirectResponse
 from src.api.endpoints import router as endpoints_router
 

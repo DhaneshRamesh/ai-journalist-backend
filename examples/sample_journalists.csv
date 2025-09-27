@@ -1,2 +1,11 @@
-name,outlet,beats,profile_url
-Alice Example,TechDaily,"tech,security",https://example.com/alice
+id,name,outlet,beats,recent_articles,profile_url,contact_public
+1,Jane Doe,TechCrunch,"AI, startups","How AI is changing seed investing; Startup X raises Series A","https://techcrunch.com/@janedoe","press@techcrunch.com"
+2,John Smith,The Verge,"AI, policy","Regulation of AI chips; Interview with policy lead","https://theverge.com/authors/john-smith",""
+3,Alice Chen,Bloomberg,"Markets, AI","AI valuations in 2025; Why investors bet on models","https://bloomberg.com/authors/alice-chen",""
+4,Robert Lee,WIRED,"AI, culture","AI art controversies; Ethics of generative models","https://www.wired.com/author/robert-lee",""
+5,Sara Khan,The Information,"AI, enterprise","Synthetic data for enterprises; AI security","https://theinformation.com/authors/sara-khan",""
+6,Emily Park,FastCompany,"Startups, design","Designing for AI-native products; Startup UX trends","https://fastcompany.com/authors/emily-park",""
+7,Tom Alvarez,Forbes,"Startups, funding","VC bets on AI devtools; Funding patterns 2025","https://forbes.com/authors/tom-alvarez",""
+8,Laura Mitchell,Financial Times,"AI, business","Business impact of large models; AI strategy","https://ft.com/authors/laura-mitchell",""
+9,Marcus Grant,NBC News,"Defense, policy","Tech and defense; Pentagon tech policy","https://nbcnews.com/authors/marcus-grant",""
+10,Karen O'Neil,Guardian,"Investigations, AI","Investigating data leaks; privacy concerns","https://theguardian.com/profile/karen-oneil",""
