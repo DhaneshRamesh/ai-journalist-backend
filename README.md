@@ -1,20 +1,26 @@
 # 📰 AI Journalist Monitor
+
 AI-powered pipeline to monitor media mentions, analyze sentiment/risk, and provide summaries — with both a FastAPI backend and a Streamlit dashboard frontend.
 
 ---
 
 ## 🚀 Features
 
-* **Backend (FastAPI)**  
+* **Backend (FastAPI)**
+  
   * Ingests and stores mentions/articles  
   * Sentiment analysis & risk detection  
   * Summarization of long texts  
   * REST API for mentions, health check, etc.
-* **Frontend (Streamlit)**  
+
+* **Frontend (Streamlit)**
+  
   * Lists mentions in a simple dashboard  
   * Shows title, summary, sentiment, risk score  
   * Buttons for future actions (flagging, suggesting journalists)
-* **Scripts**  
+
+* **Scripts**
+  
   * `process_mentions.py` → fetch & store mentions  
   * `update_mentions.py` → refresh sentiment/risk/summary  
   * `run_demo.py` → launches backend + frontend in two separate Terminal windows (local demo)
@@ -24,15 +30,18 @@ AI-powered pipeline to monitor media mentions, analyze sentiment/risk, and provi
 ## 📦 Installation
 
 Clone this repository:
+
 ```bash
 git clone https://github.com/DhaneshRamesh/ai-journalist-monitor.git
 cd ai-journalist-monitor
 ```
 
 Install dependencies globally (Python 3.13+):
+
 ```bash
 pip install -r requirements.txt
 ```
+
 *(Or install manually: `pip install fastapi uvicorn sqlalchemy streamlit requests pandas`)*
 
 ---
@@ -53,6 +62,16 @@ DATABASE_URL=postgresql://myuser@myserver:mypassword@myserver.postgres.database.
 
 **Note:** Replace `myuser`, `myserver`, `mypassword`, and `mydb` with your actual Azure database credentials.
 
+### Data Extraction Endpoints
+
+All data extraction endpoints in the FastAPI backend automatically use the configured `DATABASE_URL` connection string. The backend is configured to connect to **Azure PostgreSQL** (`ai-journalist-backend-server.postgres.database.azure.com`) by default.
+
+**Key Points:**
+- The default `DATABASE_URL` in `src/db/models.py` is set to Azure PostgreSQL connection string format: `postgresql://<username>:<password>@ai-journalist-backend-server.postgres.database.azure.com:5432/<database>?sslmode=require`
+- All API endpoints (`/api/mentions`, `/api/articles`, etc.) and data processing scripts use this connection
+- To override the default, set the `DATABASE_URL` environment variable in your `.env` file or deployment environment
+- Ensure your Azure PostgreSQL database credentials are properly configured before running the application
+
 ---
 
 ## ▶️ Running Locally
@@ -60,11 +79,12 @@ DATABASE_URL=postgresql://myuser@myserver:mypassword@myserver.postgres.database.
 ### Option 1: Manual
 
 Start backend:
+
 ```bash
 uvicorn src.api.app:app --reload
 ```
 
-  Returns latest mentions with sentiment, summary, and risk score.
+Returns latest mentions with sentiment, summary, and risk score.
 
 ---
 
@@ -75,6 +95,7 @@ uvicorn src.api.app:app --reload
 * Interactive buttons (Flag / Suggest Journalist) — demo placeholders
 
 Run it:
+
 ```bash
 python3 -m streamlit run frontend/app.py
 ```
