@@ -9,9 +9,14 @@ beautifulsoup4>=4.12.2
 vaderSentiment>=3.3.3
 pytest>=7.4.0
 streamlit>=1.26.0
+
 # Dev / optional
 sqlite3
 openai 
 faiss-cpu 
 pandas
 numpy
+
+# Azure database drivers (optional, uncomment if deploying to Azure)
+# psycopg2-binary>=2.9.9  # For Azure PostgreSQL
+# mysql-connector-python>=8.2.0  # For Azure MySQL
