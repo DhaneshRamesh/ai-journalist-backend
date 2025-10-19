@@ -1,0 +1,15 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+sqlalchemy>=2.0.20
+alembic>=1.13.0
+psycopg[binary]>=3.1.9
+pydantic>=2.8.0
+python-dotenv>=1.0.1
+requests>=2.32.2
+feedparser>=6.0.10
+azure-storage-blob>=12.20.0
+faiss-cpu>=1.8.0
+numpy>=1.26.0
+pandas>=2.2.0
+vaderSentiment==3.3.2
+beautifulsoup4>=4.12.3
