@@ -2,16 +2,17 @@
 from typing import List, Optional
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Body
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 
 from src.api.schemas import ArticleOut, MentionOut, SummarizeIn, SummarizeOut, MatchOut
 from src.db import models
 from src.db.session import get_db
 from src.processing.summarizer import summarize_text
-from src.processing.sentiment import classify  # (kept in case you use later)
-from src.processing.risk_detector import risk_score  # (kept in case you use later)
+from src.processing.sentiment import classify  # kept if you hook this into ingest later
+from src.processing.risk_detector import risk_score  # kept if you hook this into ingest later
 from src.processing.matching import rank_journalists
 from src.processing.ingest import run_ingest  # NEW
 
@@ -23,12 +24,18 @@ router = APIRouter()
 
 @router.get("/health", tags=["ops"])
 def health():
-    """Liveness: returns OK without touching external deps."""
+    """
+    Liveness: returns OK without touching external deps.
+    Useful for Azure/App Service health checks.
+    """
     return {"status": "ok"}
 
 @router.get("/ready", tags=["ops"])
 def ready(db: Session = Depends(get_db)):
-    """Readiness: verify DB connectivity."""
+    """
+    Readiness: verify DB connectivity.
+    Returns 500 with error detail if DB isn't reachable/authenticated.
+    """
     try:
         db.execute(text("SELECT 1"))
         return {"status": "ready"}
@@ -81,36 +88,24 @@ def match_demo(text: str):
 # Ingestion
 # ─────────────────────────────
 
-class IngestIn:
-    """Lightweight body schema to avoid touching existing pydantic module right now."""
-    def __init__(
-        self,
-        source: Optional[str] = None,
-        limit: int = 10,
-        backfill_days: int = 2,
-        dry_run: bool = False,
-    ):
-        self.source = source
-        self.limit = limit
-        self.backfill_days = backfill_days
-        self.dry_run = dry_run
+class IngestIn(BaseModel):
+    source: Optional[str] = None
+    limit: int = 10
+    backfill_days: int = 2
+    dry_run: bool = False
 
 def _ingest_handler(db: Session, payload: IngestIn):
     since = datetime.utcnow() - timedelta(days=payload.backfill_days)
-    result = run_ingest(
+    return run_ingest(
         db=db,
         source=payload.source,
         limit=payload.limit,
         since_utc=since,
         dry_run=payload.dry_run,
     )
-    return result
 
 @router.post("/ingest", tags=["ops"])
-def ingest(
-    payload: IngestIn = Body(default=IngestIn()),
-    db: Session = Depends(get_db),
-):
+def ingest(payload: IngestIn, db: Session = Depends(get_db)):
     """
     Kick off a synchronous ingest (demo-safe). Frontend button can call this.
     Body (JSON):
@@ -122,10 +117,7 @@ def ingest(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/ops/ingest", tags=["ops"])
-def ingest_alias(
-    payload: IngestIn = Body(default=IngestIn()),
-    db: Session = Depends(get_db),
-):
+def ingest_alias(payload: IngestIn, db: Session = Depends(get_db)):
     """
     Alias of /ingest to match earlier frontend wiring (/api/ops/ingest).
     """
