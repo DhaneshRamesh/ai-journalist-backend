@@ -39,7 +39,7 @@ def _upsert_article(db: Session, data: Dict[str, Any]) -> models.Article:
     art = models.Article(**create_kwargs)
     db.add(art)
     try:
-        db.flush()  # try insert
+        db.flush()  # attempt insert
         return art
     except IntegrityError:
         db.rollback()
@@ -80,7 +80,7 @@ def run_ingest(
     """
     Demo ingest:
       - Pretends to fetch 'limit' items since 'since_utc'
-      - Upserts a deterministic article by URL
+      - Upserts one deterministic article by URL
       - Inserts one mention for that article
     """
     demo_article = {

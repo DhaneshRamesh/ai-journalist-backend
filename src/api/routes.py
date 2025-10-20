@@ -6,17 +6,22 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 
-from src.api.schemas import ArticleOut, MentionOut, SummarizeIn, SummarizeOut, MatchOut
+from src.api.schemas import (
+    ArticleOut,
+    MentionOut,
+    SummarizeIn,
+    SummarizeOut,
+    MatchOut,
+    # IngestIn is appended to schemas.py below
+)
 from src.db import models
 from src.db.session import get_db
 from src.processing.summarizer import summarize_text
-from src.processing.sentiment import classify  # keep if you’ll use later
-from src.processing.risk_detector import risk_score  # keep if you’ll use later
 from src.processing.matching import rank_journalists
 from src.processing.ingest import run_ingest
 
-# Make your routes live under /api to match the frontend
-router = APIRouter(prefix="/api")
+# IMPORTANT: no prefix here; app.py provides /api via include_router(..., prefix=API_PREFIX)
+router = APIRouter()
 
 # ─────────────────────────────
 # Health & readiness
@@ -81,6 +86,8 @@ def match_demo(text: str):
 # Ingestion
 # ─────────────────────────────
 
+# Lightweight request model here to avoid circular imports if needed;
+# Alternatively, import IngestIn from schemas.py (preferred).
 class IngestIn(BaseModel):
     source: Optional[str] = None
     limit: int = Field(10, ge=1, le=100)
@@ -90,22 +97,11 @@ class IngestIn(BaseModel):
 def _since_from_backfill(days: int) -> datetime:
     return datetime.now(timezone.utc) - timedelta(days=days)
 
-def _ingest_handler(db: Session, payload: IngestIn):
-    since = _since_from_backfill(payload.backfill_days)
-    return run_ingest(
-        db=db,
-        source=payload.source,
-        limit=payload.limit,
-        since_utc=since,
-        dry_run=payload.dry_run,
-    )
-
 def _check_admin(x_admin_token: Optional[str]) -> None:
     import os
     admin_token = os.environ.get("ADMIN_TOKEN")
-    if admin_token:
-        if not x_admin_token or x_admin_token != admin_token:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    if admin_token and (not x_admin_token or x_admin_token != admin_token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 @router.post("/ingest", tags=["ops"])
 def ingest(
@@ -116,11 +112,18 @@ def ingest(
     """
     Kick off a synchronous demo-safe ingest.
     Body:
-      { "source": "rss|demo|...", "limit": 10, "backfill_days": 2, "dry_run": false }
+      { "source": "demo", "limit": 1, "backfill_days": 2, "dry_run": false }
     """
     _check_admin(x_admin_token)
+    since = _since_from_backfill(payload.backfill_days)
     try:
-        return _ingest_handler(db, payload)
+        return run_ingest(
+            db=db,
+            source=payload.source,
+            limit=payload.limit,
+            since_utc=since,
+            dry_run=payload.dry_run,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -130,11 +133,5 @@ def ingest_alias(
     db: Session = Depends(get_db),
     x_admin_token: Optional[str] = Header(default=None),
 ):
-    """
-    Alias of /api/ingest to match earlier frontend wiring (/api/ops/ingest).
-    """
-    _check_admin(x_admin_token)
-    try:
-        return _ingest_handler(db, payload)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Alias to support older frontend path /api/ops/ingest."""
+    return ingest(payload, db, x_admin_token)
