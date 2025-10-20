@@ -1,9 +1,9 @@
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Query
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload  # ← ADDED joinedload
 from pydantic import BaseModel, Field
 
 from src.api.schemas import (
@@ -12,7 +12,8 @@ from src.api.schemas import (
     SummarizeIn,
     SummarizeOut,
     MatchOut,
-    # IngestIn is appended to schemas.py below
+    IngestIn,  # ← NOW IMPORTED FROM schemas.py
+    IngestOut,  # ← NEW: For ingest response
 )
 from src.db import models
 from src.db.session import get_db
@@ -24,7 +25,7 @@ from src.processing.ingest import run_ingest
 router = APIRouter()
 
 # ─────────────────────────────
-# Health & readiness
+# Health & readiness (UNCHANGED)
 # ─────────────────────────────
 
 @router.get("/health", tags=["ops"])
@@ -42,31 +43,52 @@ def ready(db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────
-# Data APIs
+# Data APIs - FIXED FOR NESTED ARTICLES
 # ─────────────────────────────
 
 @router.get("/articles", response_model=List[ArticleOut], tags=["data"])
-def list_articles(limit: int = 50, db: Session = Depends(get_db)):
-    limit = max(1, min(limit, 200))
-    q = (
-        db.query(models.Article)
-        .order_by(models.Article.published.desc().nullslast())
-        .limit(limit)
+def list_articles(
+    limit: int = Query(50, ge=1, le=200),  # ← Added Query validation
+    source: Optional[str] = Query(None),   # ← Added source filter
+    db: Session = Depends(get_db)
+):
+    q = db.query(models.Article)
+    
+    if source:
+        q = q.filter(models.Article.source.ilike(f"%{source}%"))
+    
+    return (
+        q.order_by(models.Article.published.desc().nullslast())
+         .limit(limit)
+         .all()
     )
-    return q.all()
 
 @router.get("/mentions", response_model=List[MentionOut], tags=["data"])
-def list_mentions(limit: int = 50, db: Session = Depends(get_db)):
-    limit = max(1, min(limit, 200))
+def list_mentions(
+    limit: int = Query(50, ge=1, le=200),   # ← Added Query validation
+    source: Optional[str] = Query(None),    # ← Added source filter
+    db: Session = Depends(get_db)
+):
+    """List recent mentions WITH NESTED ARTICLES"""
     q = (
         db.query(models.Mention)
-        .order_by(models.Mention.created_at.desc())
-        .limit(limit)
+        .options(joinedload(models.Mention.article))  # ← KEY FIX: EAGER LOAD ARTICLE
     )
-    return q.all()
+    
+    if source:
+        # Filter by article source (requires join)
+        q = q.join(models.Mention.article).filter(
+            models.Article.source.ilike(f"%{source}%")
+        )
+    
+    return (
+        q.order_by(models.Mention.created_at.desc())
+         .limit(limit)
+         .all()
+    )
 
 # ─────────────────────────────
-# Processing / utilities
+# Processing / utilities (UNCHANGED)
 # ─────────────────────────────
 
 @router.post("/summarize", response_model=SummarizeOut, tags=["nlp"])
@@ -83,16 +105,8 @@ def match_demo(text: str):
     return rank_journalists(text, candidates, top_k=5)
 
 # ─────────────────────────────
-# Ingestion
+# Ingestion - UPDATED TO USE schemas.py + IngestOut
 # ─────────────────────────────
-
-# Lightweight request model here to avoid circular imports if needed;
-# Alternatively, import IngestIn from schemas.py (preferred).
-class IngestIn(BaseModel):
-    source: Optional[str] = None
-    limit: int = Field(10, ge=1, le=100)
-    backfill_days: int = Field(2, ge=0, le=30)
-    dry_run: bool = False
 
 def _since_from_backfill(days: int) -> datetime:
     return datetime.now(timezone.utc) - timedelta(days=days)
@@ -103,9 +117,9 @@ def _check_admin(x_admin_token: Optional[str]) -> None:
     if admin_token and (not x_admin_token or x_admin_token != admin_token):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-@router.post("/ingest", tags=["ops"])
+@router.post("/ingest", response_model=IngestOut, tags=["ops"])  # ← FIXED: IngestOut response
 def ingest(
-    payload: IngestIn,
+    payload: IngestIn,  # ← NOW FROM schemas.py
     db: Session = Depends(get_db),
     x_admin_token: Optional[str] = Header(default=None),
 ):
@@ -115,19 +129,30 @@ def ingest(
       { "source": "demo", "limit": 1, "backfill_days": 2, "dry_run": false }
     """
     _check_admin(x_admin_token)
-    since = _since_from_backfill(payload.backfill_days)
+    
+    # Convert backfill_days -> since_utc (your ingest.py expects since_utc)
+    since_utc = payload.since_utc
+    if payload.backfill_days > 0 and not since_utc:
+        since_utc = _since_from_backfill(payload.backfill_days)
+    
+    # Default source="google" if None
+    source = payload.source or "google"
+    
     try:
-        return run_ingest(
+        result = run_ingest(
             db=db,
-            source=payload.source,
+            source=source,
             limit=payload.limit,
-            since_utc=since,
+            since_utc=since_utc or datetime.now(timezone.utc) - timedelta(hours=24),
+            keywords=payload.keywords,
+            per_keyword_limit=payload.per_keyword_limit,
             dry_run=payload.dry_run,
         )
+        return IngestOut(**result)  # ← WRAP IN IngestOut
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/ops/ingest", tags=["ops"])
+@router.post("/ops/ingest", response_model=IngestOut, tags=["ops"])  # ← FIXED response
 def ingest_alias(
     payload: IngestIn,
     db: Session = Depends(get_db),
