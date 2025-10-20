@@ -1,6 +1,5 @@
-# src/processing/ingest.py
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 from sqlalchemy.orm import Session
@@ -8,6 +7,9 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
 from src.db import models
+
+def _utcnow():
+    return datetime.now(timezone.utc)
 
 def _model_columns(model) -> set[str]:
     return {c.key for c in model.__table__.columns}
@@ -21,16 +23,13 @@ def _get_article_by_url(db: Session, url: str):
 
 def _upsert_article(db: Session, data: Dict[str, Any]) -> models.Article:
     """
-    Upsert by URL. Only writes fields that exist on the Article model.
-    Handles IntegrityError (unique constraint) by reloading the existing row.
+    Upsert Article by unique URL.
     """
     url = data["url"]
-    # Filter to existing columns
     create_kwargs = _filtered_kwargs(data, models.Article)
 
     existing = _get_article_by_url(db, url)
     if existing:
-        # Update existing fields ONLY if they exist
         for k, v in create_kwargs.items():
             if k != "id":
                 setattr(existing, k, v)
@@ -40,11 +39,10 @@ def _upsert_article(db: Session, data: Dict[str, Any]) -> models.Article:
     art = models.Article(**create_kwargs)
     db.add(art)
     try:
-        db.flush()  # attempt insert
+        db.flush()  # try insert
         return art
     except IntegrityError:
         db.rollback()
-        # Another request may have created it; load and update it
         existing = _get_article_by_url(db, url)
         if existing:
             for k, v in create_kwargs.items():
@@ -53,20 +51,19 @@ def _upsert_article(db: Session, data: Dict[str, Any]) -> models.Article:
             db.add(existing)
             db.flush()
             return existing
-        raise  # re-raise if truly unexpected
+        raise
 
 def _insert_demo_mention(db: Session, article_id: int):
     """
-    Insert one mention tied to the article.
-    Only sets fields that exist on Mention model.
+    Insert a mention linked to the article. Extra fields are safely ignored.
     """
     payload = {
         "article_id": article_id,
-        "entity": "Silverseven",
+        "summary": "Auto summary (demo): AI Journalist pipeline verified.",
         "sentiment": "neutral",
-        "risk": 0.12,
-        "created_at": datetime.utcnow(),
-        # Add more fields here if your Mention model has them (summary, title, etc.)
+        "risk_score": 0.12,
+        "named_entities": "Silverseven; AI; demo",
+        "created_at": _utcnow(),
     }
     kwargs = _filtered_kwargs(payload, models.Mention)
     m = models.Mention(**kwargs)
@@ -83,22 +80,21 @@ def run_ingest(
     """
     Demo ingest:
       - Pretends to fetch 'limit' items since 'since_utc'
-      - Upserts ONE deterministic article by URL
+      - Upserts a deterministic article by URL
       - Inserts one mention for that article
     """
     demo_article = {
         "url": "https://example.com/ai-journalist-demo-article",
         "title": "AI Journalist monitor connected end-to-end",
         "source": source or "demo",
-        "published": datetime.utcnow(),
+        "published": _utcnow(),
         "content": (
             "This is a demo article created by the ingest endpoint to verify the pipeline. "
             "Replace run_ingest(...) with your real ingestion logic."
         ),
-        "created_at": datetime.utcnow(),  # will be ignored if column doesn't exist
+        "created_at": _utcnow(),  # ignored if Article lacks this column
     }
 
-    # Counts before
     before_articles = db.query(func.count(models.Article.id)).scalar() or 0
     before_mentions = db.query(func.count(models.Mention.id)).scalar() or 0
 
@@ -120,7 +116,6 @@ def run_ingest(
         db.commit()
     except Exception as e:
         db.rollback()
-        # Return a structured error so you see the root cause in the frontend
         return {
             "status": "error",
             "message": f"Ingest failed: {e.__class__.__name__}: {str(e)}",
@@ -128,7 +123,6 @@ def run_ingest(
             "since_utc": since_utc.isoformat(),
         }
 
-    # Counts after
     after_articles = db.query(func.count(models.Article.id)).scalar() or 0
     after_mentions = db.query(func.count(models.Mention.id)).scalar() or 0
 
