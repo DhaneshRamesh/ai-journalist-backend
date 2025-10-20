@@ -53,10 +53,11 @@ class MatchOut(BaseModel):
 #  - backfill_days (preferred by routes.py wrapper)
 #  - since_utc (if you want to pass an explicit timestamp)
 class IngestIn(BaseModel):
-    source: Optional[str] = None
-    limit: int = Field(10, ge=1, le=100)
-    # routes.py computes since_utc from this if since_utc not supplied
-    backfill_days: int = Field(2, ge=0, le=30)
-    # optional explicit timestamp (ISO 8601). If provided, your route can override backfill_days.
-    since_utc: Optional[datetime] = None
+    source: Optional[str] = None                  # "google" for RSS mode, anything else -> demo
+    limit: int = Field(10, ge=1, le=200)         # total max items across keywords
+    backfill_days: int = Field(1, ge=0, le=30)   # kept for compatibility (not used in RSS mode)
+    since_utc: Optional[datetime] = None         # optional explicit TS (not used in RSS mode)
     dry_run: bool = False
+    keywords: Optional[List[str]] = None         # e.g., ["AI","journalism","startups"]
+    per_keyword_limit: int = Field(5, ge=1, le=50)
+
