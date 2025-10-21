@@ -1,33 +1,31 @@
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone
-
 from fastapi import APIRouter, Depends, HTTPException, Header, Query
-from sqlalchemy import text
-from sqlalchemy.orm import Session, joinedload  # ← ADDED joinedload
+from sqlalchemy import text, func
+from sqlalchemy.orm import Session, joinedload
 from pydantic import BaseModel, Field
-
 from src.api.schemas import (
     ArticleOut,
     MentionOut,
     SummarizeIn,
     SummarizeOut,
     MatchOut,
-    IngestIn,  # ← NOW IMPORTED FROM schemas.py
-    IngestOut,  # ← NEW: For ingest response
+    IngestIn,
+    IngestOut,
 )
 from src.db import models
 from src.db.session import get_db
 from src.processing.summarizer import summarize_text
 from src.processing.matching import rank_journalists
-from src.processing.ingest import run_ingest
+from src.processing.ingest import run_ingest, run_recent_ingest
+import logging
 
-# IMPORTANT: no prefix here; app.py provides /api via include_router(..., prefix=API_PREFIX)
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # ─────────────────────────────
-# Health & readiness (UNCHANGED)
+# Health & readiness
 # ─────────────────────────────
-
 @router.get("/health", tags=["ops"])
 def health():
     """Liveness: returns OK without external deps."""
@@ -43,20 +41,81 @@ def ready(db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────
-# Data APIs - FIXED FOR NESTED ARTICLES
+# Dynamic keywords ingestion
 # ─────────────────────────────
+@router.post("/ingest/dynamic", response_model=dict, tags=["ops"])
+def ingest_dynamic_keywords(
+    keywords: Optional[List[str]] = Query(
+        default=None,
+        description="Search keywords (e.g. ?keywords=climate%20change&keywords=OpenAI)"
+    ),
+    per_keyword_limit: int = Query(
+        default=5, ge=1, le=20,
+        description="Articles per keyword"
+    ),
+    limit: int = Query(
+        default=50, ge=1, le=200,
+        description="Total articles limit"
+    ),
+    hours_back: int = Query(
+        default=24, ge=1, le=168,
+        description="Look back hours"
+    ),
+    x_admin_token: Optional[str] = Header(default=None),
+    db: Session = Depends(get_db)
+):
+    """
+    Dynamic Google News ingestion by keywords.
+    
+    POST /api/ingest/dynamic?keywords=climate%20change&keywords=OpenAI&per_keyword_limit=10
+    """
+    _check_admin(x_admin_token)
+    
+    if not keywords or len(keywords) == 0:
+        keywords = ["AI", "journalism"]
+        logger.warning("No keywords provided, using defaults")
+    
+    logger.info(f"Dynamic ingest: keywords={keywords}, per_kw={per_keyword_limit}, limit={limit}")
+    
+    result = run_recent_ingest(
+        db=db,
+        limit=limit,
+        keywords=keywords,
+        per_keyword_limit=per_keyword_limit,
+        hours_back=hours_back
+    )
+    
+    if result.get("status") == "ok":
+        stats = result["stats"]
+        return {
+            "status": "success",
+            "inserted": stats["articles_inserted"],
+            "total_fetched": stats["fetched"],
+            "mentions_created": stats["mentions_inserted"],
+            "keywords_searched": keywords,
+            "per_keyword_limit": per_keyword_limit,
+            "total_articles": result["counts_after"]["articles"],
+            "total_mentions": result["counts_after"]["mentions"],
+            "full_stats": result
+        }
+    else:
+        logger.error(f"Dynamic ingest failed: {result}")
+        raise HTTPException(status_code=400, detail=result.get("message", "Ingestion failed"))
 
+# ─────────────────────────────
+# Data APIs
+# ─────────────────────────────
 @router.get("/articles", response_model=List[ArticleOut], tags=["data"])
 def list_articles(
-    limit: int = Query(50, ge=1, le=200),  # ← Added Query validation
-    source: Optional[str] = Query(None),   # ← Added source filter
+    limit: int = Query(50, ge=1, le=200),
+    source: Optional[str] = Query(None),
     db: Session = Depends(get_db)
 ):
     q = db.query(models.Article)
-    
+   
     if source:
         q = q.filter(models.Article.source.ilike(f"%{source}%"))
-    
+   
     return (
         q.order_by(models.Article.published.desc().nullslast())
          .limit(limit)
@@ -65,22 +124,21 @@ def list_articles(
 
 @router.get("/mentions", response_model=List[MentionOut], tags=["data"])
 def list_mentions(
-    limit: int = Query(50, ge=1, le=200),   # ← Added Query validation
-    source: Optional[str] = Query(None),    # ← Added source filter
+    limit: int = Query(50, ge=1, le=200),
+    source: Optional[str] = Query(None),
     db: Session = Depends(get_db)
 ):
-    """List recent mentions WITH NESTED ARTICLES"""
+    """List recent mentions with nested articles"""
     q = (
         db.query(models.Mention)
-        .options(joinedload(models.Mention.article))  # ← KEY FIX: EAGER LOAD ARTICLE
+        .options(joinedload(models.Mention.article))
     )
-    
+   
     if source:
-        # Filter by article source (requires join)
         q = q.join(models.Mention.article).filter(
             models.Article.source.ilike(f"%{source}%")
         )
-    
+   
     return (
         q.order_by(models.Mention.created_at.desc())
          .limit(limit)
@@ -88,26 +146,47 @@ def list_mentions(
     )
 
 # ─────────────────────────────
-# Processing / utilities (UNCHANGED)
+# Processing / utilities
 # ─────────────────────────────
-
 @router.post("/summarize", response_model=SummarizeOut, tags=["nlp"])
 def summarize(payload: SummarizeIn):
     return {"summary": summarize_text(payload.text)}
 
 @router.get("/match", response_model=List[MatchOut], tags=["nlp"])
-def match_demo(text: str):
+def match_from_db(
+    text: str = Query(..., description="Text to match journalists against"),
+    top_k: int = Query(5, ge=1, le=20),
+    db: Session = Depends(get_db)
+):
+    """
+    Match journalists from database against input text.
+    
+    GET /api/match?text=AI%20startups&top_k=3
+    """
+    journalists = db.query(models.Journalist).all()
+    
+    if not journalists:
+        logger.warning("No journalists found in database")
+        return []
+    
     candidates = [
-        {"id": 1, "name": "Alex Smith", "outlet": "TechNews", "topics": "AI, startups, VC"},
-        {"id": 2, "name": "Priya Rao", "outlet": "FinDaily", "topics": "fintech, banking, regulation"},
-        {"id": 3, "name": "Liam Chen", "outlet": "Aussie Times", "topics": "Australia, policy, tech"},
+        {
+            "id": j.id,
+            "name": j.name,
+            "outlet": getattr(j, 'outlet', ''),
+            "topics": getattr(j, 'topics', '')
+        }
+        for j in journalists
     ]
-    return rank_journalists(text, candidates, top_k=5)
+    
+    logger.info(f"Matching '{text}' against {len(candidates)} journalists")
+    
+    matches = rank_journalists(text, candidates, top_k=top_k)
+    return matches
 
 # ─────────────────────────────
-# Ingestion - UPDATED TO USE schemas.py + IngestOut
+# Legacy ingestion endpoints
 # ─────────────────────────────
-
 def _since_from_backfill(days: int) -> datetime:
     return datetime.now(timezone.utc) - timedelta(days=days)
 
@@ -117,27 +196,26 @@ def _check_admin(x_admin_token: Optional[str]) -> None:
     if admin_token and (not x_admin_token or x_admin_token != admin_token):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-@router.post("/ingest", response_model=IngestOut, tags=["ops"])  # ← FIXED: IngestOut response
+@router.post("/ingest", response_model=IngestOut, tags=["ops"])
 def ingest(
-    payload: IngestIn,  # ← NOW FROM schemas.py
+    payload: IngestIn,
     db: Session = Depends(get_db),
     x_admin_token: Optional[str] = Header(default=None),
 ):
     """
-    Kick off a synchronous demo-safe ingest.
-    Body:
-      { "source": "demo", "limit": 1, "backfill_days": 2, "dry_run": false }
+    Legacy synchronous ingestion via JSON body.
+    
+    POST /api/ingest
+    Body: { "source": "google", "limit": 10, "backfill_days": 2, "dry_run": false }
     """
     _check_admin(x_admin_token)
-    
-    # Convert backfill_days -> since_utc (your ingest.py expects since_utc)
+   
     since_utc = payload.since_utc
     if payload.backfill_days > 0 and not since_utc:
         since_utc = _since_from_backfill(payload.backfill_days)
-    
-    # Default source="google" if None
+   
     source = payload.source or "google"
-    
+   
     try:
         result = run_ingest(
             db=db,
@@ -148,15 +226,39 @@ def ingest(
             per_keyword_limit=payload.per_keyword_limit,
             dry_run=payload.dry_run,
         )
-        return IngestOut(**result)  # ← WRAP IN IngestOut
+        return IngestOut(**result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/ops/ingest", response_model=IngestOut, tags=["ops"])  # ← FIXED response
+@router.post("/ops/ingest", response_model=IngestOut, tags=["ops"])
 def ingest_alias(
     payload: IngestIn,
     db: Session = Depends(get_db),
     x_admin_token: Optional[str] = Header(default=None),
 ):
-    """Alias to support older frontend path /api/ops/ingest."""
+    """Alias for older frontend path /api/ops/ingest."""
     return ingest(payload, db, x_admin_token)
+
+# ─────────────────────────────
+# Stats endpoint
+# ─────────────────────────────
+@router.get("/stats", tags=["data"])
+def get_stats(db: Session = Depends(get_db)):
+    """Dashboard statistics"""
+    try:
+        sentiment_stats = db.query(
+            models.Mention.sentiment,
+            func.count(models.Mention.id)
+        ).group_by(models.Mention.sentiment).all()
+        
+        return {
+            "total_articles": db.query(func.count(models.Article.id)).scalar() or 0,
+            "total_mentions": db.query(func.count(models.Mention.id)).scalar() or 0,
+            "sentiment_distribution": dict(sentiment_stats),
+            "recent_mentions": db.query(func.count(models.Mention.id)).filter(
+                models.Mention.created_at >= datetime.now(timezone.utc) - timedelta(hours=24)
+            ).scalar() or 0
+        }
+    except Exception as e:
+        logger.error(f"Stats failed: {e}")
+        raise HTTPException(status_code=500, detail="Stats failed")
