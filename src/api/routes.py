@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Union
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Header, Query
 from sqlalchemy import text, func
@@ -39,68 +39,6 @@ def ready(db: Session = Depends(get_db)):
         return {"status": "ready"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# ─────────────────────────────
-# Dynamic keywords ingestion
-# ─────────────────────────────
-@router.post("/ingest/dynamic", response_model=dict, tags=["ops"])
-def ingest_dynamic_keywords(
-    keywords: Optional[List[str]] = Query(
-        default=None,
-        description="Search keywords (e.g. ?keywords=climate%20change&keywords=OpenAI)"
-    ),
-    per_keyword_limit: int = Query(
-        default=5, ge=1, le=20,
-        description="Articles per keyword"
-    ),
-    limit: int = Query(
-        default=50, ge=1, le=200,
-        description="Total articles limit"
-    ),
-    hours_back: int = Query(
-        default=24, ge=1, le=168,
-        description="Look back hours"
-    ),
-    x_admin_token: Optional[str] = Header(default=None),
-    db: Session = Depends(get_db)
-):
-    """
-    Dynamic Google News ingestion by keywords.
-    
-    POST /api/ingest/dynamic?keywords=climate%20change&keywords=OpenAI&per_keyword_limit=10
-    """
-    _check_admin(x_admin_token)
-    
-    if not keywords or len(keywords) == 0:
-        keywords = ["AI", "journalism"]
-        logger.warning("No keywords provided, using defaults")
-    
-    logger.info(f"Dynamic ingest: keywords={keywords}, per_kw={per_keyword_limit}, limit={limit}")
-    
-    result = run_recent_ingest(
-        db=db,
-        limit=limit,
-        keywords=keywords,
-        per_keyword_limit=per_keyword_limit,
-        hours_back=hours_back
-    )
-    
-    if result.get("status") == "ok":
-        stats = result["stats"]
-        return {
-            "status": "success",
-            "inserted": stats["articles_inserted"],
-            "total_fetched": stats["fetched"],
-            "mentions_created": stats["mentions_inserted"],
-            "keywords_searched": keywords,
-            "per_keyword_limit": per_keyword_limit,
-            "total_articles": result["counts_after"]["articles"],
-            "total_mentions": result["counts_after"]["mentions"],
-            "full_stats": result
-        }
-    else:
-        logger.error(f"Dynamic ingest failed: {result}")
-        raise HTTPException(status_code=400, detail=result.get("message", "Ingestion failed"))
 
 # ─────────────────────────────
 # Data APIs
@@ -185,25 +123,78 @@ def match_from_db(
     return matches
 
 # ─────────────────────────────
-# Legacy ingestion endpoints
+# Ingestion - DUAL MODE: JSON BODY + QUERY PARAMS
 # ─────────────────────────────
 def _since_from_backfill(days: int) -> datetime:
     return datetime.now(timezone.utc) - timedelta(days=days)
 
-def _check_admin(x_admin_token: Optional[str]) -> None:
+def _check_admin(x_admin_token: Optional[str] = None) -> None:
     import os
     admin_token = os.environ.get("ADMIN_TOKEN")
     if admin_token and (not x_admin_token or x_admin_token != admin_token):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+# 🔥 OVERLOAD 1: DYNAMIC QUERY PARAMS (FRONTEND - FIXES 422 ERROR!)
+@router.post("/ingest", response_model=dict, tags=["ops"])
+def ingest_query_params(
+    # Query params for frontend textarea
+    keywords: Optional[List[str]] = Query(None, description="Search keywords"),
+    per_keyword_limit: int = Query(5, ge=1, le=20),
+    limit: int = Query(50, ge=1, le=200),
+    hours_back: int = Query(24, ge=1, le=168),
+    dry_run: bool = Query(False),
+    db: Session = Depends(get_db),
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    """
+    Dynamic ingestion via query params - FRONTEND READY!
+    
+    POST /api/ingest?keywords=India&per_keyword_limit=5&limit=50
+    """
+    _check_admin(x_admin_token)
+    
+    if not keywords or len(keywords) == 0:
+        keywords = ["AI", "journalism"]
+        logger.warning("No keywords provided, using defaults")
+    
+    logger.info(f"Query param ingest: keywords={keywords}, per_kw={per_keyword_limit}, limit={limit}")
+    
+    result = run_recent_ingest(
+        db=db,
+        limit=limit,
+        keywords=keywords,
+        per_keyword_limit=per_keyword_limit,
+        hours_back=hours_back,
+        dry_run=dry_run
+    )
+    
+    if result.get("status") == "ok":
+        stats = result["stats"]
+        return {
+            "status": "success",
+            "message": f"Fetched articles for {len(keywords)} keywords",
+            "inserted": stats["articles_inserted"],
+            "total_fetched": stats["fetched"],
+            "mentions_created": stats["mentions_inserted"],
+            "keywords_searched": keywords,
+            "per_keyword_limit": per_keyword_limit,
+            "total_articles": result["counts_after"]["articles"],
+            "total_mentions": result["counts_after"]["mentions"],
+            "full_stats": result
+        }
+    else:
+        logger.error(f"Query param ingest failed: {result}")
+        raise HTTPException(status_code=400, detail=result.get("message", "Ingestion failed"))
+
+# 🔥 OVERLOAD 2: LEGACY JSON BODY (app.py Operations tab)
 @router.post("/ingest", response_model=IngestOut, tags=["ops"])
-def ingest(
+def ingest_json_body(
     payload: IngestIn,
     db: Session = Depends(get_db),
     x_admin_token: Optional[str] = Header(default=None),
 ):
     """
-    Legacy synchronous ingestion via JSON body.
+    Legacy ingestion via JSON body - BACKWARD COMPATIBLE!
     
     POST /api/ingest
     Body: { "source": "google", "limit": 10, "backfill_days": 2, "dry_run": false }
@@ -228,8 +219,10 @@ def ingest(
         )
         return IngestOut(**result)
     except Exception as e:
+        logger.error(f"JSON body ingest failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# Legacy alias for older frontend path
 @router.post("/ops/ingest", response_model=IngestOut, tags=["ops"])
 def ingest_alias(
     payload: IngestIn,
@@ -237,7 +230,7 @@ def ingest_alias(
     x_admin_token: Optional[str] = Header(default=None),
 ):
     """Alias for older frontend path /api/ops/ingest."""
-    return ingest(payload, db, x_admin_token)
+    return ingest_json_body(payload, db, x_admin_token)
 
 # ─────────────────────────────
 # Stats endpoint
