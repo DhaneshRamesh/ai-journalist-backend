@@ -64,9 +64,11 @@ def list_articles(
 def list_mentions(
     limit: int = Query(50, ge=1, le=200),
     source: Optional[str] = Query(None),
+    sentiment: Optional[str] = Query(None),
+    flagged: Optional[bool] = Query(None),
     db: Session = Depends(get_db)
 ):
-    """List recent mentions with nested articles"""
+    """List recent mentions with nested articles, supporting sentiment and flagged filters."""
     q = (
         db.query(models.Mention)
         .options(joinedload(models.Mention.article))
@@ -76,6 +78,10 @@ def list_mentions(
         q = q.join(models.Mention.article).filter(
             models.Article.source.ilike(f"%{source}%")
         )
+    if sentiment:
+        q = q.filter(models.Mention.sentiment == sentiment.lower())
+    if flagged is not None:
+        q = q.filter(models.Mention.flagged == flagged)
    
     return (
         q.order_by(models.Mention.created_at.desc())
@@ -88,8 +94,17 @@ def list_mentions(
 # ─────────────────────────────
 @router.post("/summarize", response_model=SummarizeOut, tags=["nlp"])
 def summarize(payload: SummarizeIn):
-    return {"summary": summarize_text(payload.text)}
+    """Generate a summary in 2-3 bullet points using GPT-4o-mini."""
+    try:
+        summary = summarize_text(payload.text)
+        return {"summary": summary}
+    except Exception as e:
+        logger.error(f"Summarization failed: {e}")
+        raise HTTPException(status_code=500, detail="Summarization failed")
 
+# ─────────────────────────────
+# Matching
+# ─────────────────────────────
 @router.get("/match", response_model=List[MatchOut], tags=["nlp"])
 def match_from_db(
     text: str = Query(..., description="Text to match journalists against"),
@@ -253,7 +268,7 @@ def get_stats(db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Stats failed")
 
 # ─────────────────────────────
-# Flag endpoint (NEW!)
+# Flag endpoint
 # ─────────────────────────────
 @router.post("/flag", tags=["ops"])
 def flag_article(
