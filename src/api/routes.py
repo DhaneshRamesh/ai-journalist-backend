@@ -134,10 +134,8 @@ def _check_admin(x_admin_token: Optional[str] = None) -> None:
     if admin_token and (not x_admin_token or x_admin_token != admin_token):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-# 🔥 OVERLOAD 1: DYNAMIC QUERY PARAMS (FRONTEND - FIXES 422 ERROR!)
 @router.post("/ingest", response_model=dict, tags=["ops"])
 def ingest_query_params(
-    # Query params for frontend textarea
     keywords: Optional[List[str]] = Query(None, description="Search keywords"),
     per_keyword_limit: int = Query(5, ge=1, le=20),
     limit: int = Query(50, ge=1, le=200),
@@ -186,7 +184,6 @@ def ingest_query_params(
         logger.error(f"Query param ingest failed: {result}")
         raise HTTPException(status_code=400, detail=result.get("message", "Ingestion failed"))
 
-# 🔥 OVERLOAD 2: LEGACY JSON BODY (app.py Operations tab)
 @router.post("/ingest", response_model=IngestOut, tags=["ops"])
 def ingest_json_body(
     payload: IngestIn,
@@ -222,7 +219,6 @@ def ingest_json_body(
         logger.error(f"JSON body ingest failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Legacy alias for older frontend path
 @router.post("/ops/ingest", response_model=IngestOut, tags=["ops"])
 def ingest_alias(
     payload: IngestIn,
@@ -255,3 +251,30 @@ def get_stats(db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Stats failed: {e}")
         raise HTTPException(status_code=500, detail="Stats failed")
+
+# ─────────────────────────────
+# Flag endpoint (NEW!)
+# ─────────────────────────────
+@router.post("/flag", tags=["ops"])
+def flag_article(
+    article_id: int = Query(..., description="Article ID to flag"),
+    reason: str = Query("urgent", description="Flag reason"),
+    db: Session = Depends(get_db),
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    """
+    Flag an article for manual review.
+    
+    POST /api/flag?article_id=19&reason=urgent
+    """
+    _check_admin(x_admin_token)
+    mention = db.query(models.Mention).filter(models.Mention.article_id == article_id).first()
+    if mention:
+        mention.flagged = True
+        mention.flag_reason = reason
+        mention.flagged_at = datetime.now(timezone.utc)
+        db.commit()
+        logger.info(f"Flagged article {article_id}: {reason}")
+        return {"status": "flagged", "article_id": article_id, "reason": reason}
+    else:
+        raise HTTPException(status_code=404, detail="Article not found")
