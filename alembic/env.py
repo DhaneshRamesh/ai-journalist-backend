@@ -3,24 +3,26 @@ from __future__ import annotations
 import os
 import sys
 from logging.config import fileConfig
-
+from configparser import ConfigParser
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 # ─────────────────────────────────────────────────────────────
 # Make project importable in both local and Azure App Service
 # ─────────────────────────────────────────────────────────────
-# 1) repo root at runtime (App Service sets cwd to /home/site/wwwroot)
-sys.path.append(os.getcwd())
-# 2) also add the parent of the alembic/ folder (repo root fallback)
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.append(os.getcwd())  # App Service runtime
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))  # fallback
 
 # ─────────────────────────────────────────────────────────────
-# Alembic Config
+# Alembic Config — disable interpolation to fix '%' in Azure passwords
 # ─────────────────────────────────────────────────────────────
+parser = ConfigParser(interpolation=None)
+parser.read(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
+
 config = context.config
+config.file_config = parser  # override interpolation handling
 
-# Configure logging from alembic.ini if present
+# Configure logging if alembic.ini exists
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
@@ -29,24 +31,22 @@ if config.config_file_name is not None:
 # ─────────────────────────────────────────────────────────────
 from src.db.base import Base  # noqa: E402
 from src.db import models     # noqa: F401  # register tables
-
 target_metadata = Base.metadata
 
 # ─────────────────────────────────────────────────────────────
-# Resolve database URL
+# Resolve database URL dynamically (Azure or local)
 # ─────────────────────────────────────────────────────────────
 DB_URL_ENV = os.getenv("DATABASE_URL")
 
 def _resolve_url() -> str:
-    """
-    Prefer DATABASE_URL (prod/Azure). If missing, fall back to local SQLite
-    to keep developer experience smooth.
-    """
+    """Prefer DATABASE_URL (prod/Azure). If missing, fall back to SQLite."""
     if DB_URL_ENV:
         return DB_URL_ENV
-    # Local dev fallback
     return "sqlite:///./dev.db"
 
+# ─────────────────────────────────────────────────────────────
+# Migration runners
+# ─────────────────────────────────────────────────────────────
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode'."""
     url = _resolve_url()
@@ -64,7 +64,6 @@ def run_migrations_offline() -> None:
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode'."""
     url = _resolve_url()
-    # Inject sqlalchemy.url at runtime (don’t hardcode in .ini)
     config.set_main_option("sqlalchemy.url", url)
 
     connectable = engine_from_config(
