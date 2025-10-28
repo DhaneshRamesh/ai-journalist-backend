@@ -327,14 +327,11 @@ def ingest_google_news(request: IngestRequest, db_url: str) -> IngestStats:
         for i, adata in enumerate(articles):
             try:
                 article = _upsert_article(db, adata)
-
-                if _article_by_unique(db, _unique_key_name(), adata[_unique_key_name()]):
-                    stats = stats._replace(articles_updated=stats.articles_updated + 1)
-                else:
-                    stats = stats._replace(articles_inserted=stats.articles_inserted + 1)
-
                 _insert_mention(db, article)
-                stats = stats._replace(mentions_inserted=stats.mentions_inserted + 1)
+                stats = stats._replace(
+                    articles_inserted=stats.articles_inserted + 1,
+                    mentions_inserted=stats.mentions_inserted + 1,
+                )
 
                 batch_counter += 1
                 if batch_counter >= config.batch_commit_size:
@@ -354,17 +351,24 @@ def ingest_google_news(request: IngestRequest, db_url: str) -> IngestStats:
 
     logger.info(
         f"Ingestion complete → inserted {stats.articles_inserted}, "
-        f"updated {stats.articles_updated}, mentions {stats.mentions_inserted}, "
-        f"errors {stats.errors}"
+        f"mentions {stats.mentions_inserted}, errors {stats.errors}"
     )
     return stats
 
 
 # ----------------------------------------------------------------------
-# Backward-compatible wrappers for FastAPI routes
+# Backward-compatible wrappers for FastAPI routes (accept db Session)
 # ----------------------------------------------------------------------
-def run_ingest(db_url: str, keywords: Optional[List[str]] = None, limit: int = 10):
-    """Legacy wrapper used by FastAPI routes."""
+def run_ingest(db=None, db_url: Optional[str] = None, keywords: Optional[List[str]] = None, limit: int = 10):
+    """Wrapper compatible with FastAPI route calls (db=Session or db_url=str)."""
+    from sqlalchemy.orm import Session
+
+    if isinstance(db, Session):
+        engine = db.get_bind()
+        db_url = str(engine.url)
+    elif not db_url:
+        raise ValueError("Either db (Session) or db_url must be provided")
+
     req = IngestRequest(
         source="google",
         limit=limit,
@@ -375,8 +379,16 @@ def run_ingest(db_url: str, keywords: Optional[List[str]] = None, limit: int = 1
     return ingest_google_news(req, db_url)
 
 
-def run_recent_ingest(db_url: str, hours: int = 6, limit: int = 10):
-    """Fetch recent articles (default: last 6h)."""
+def run_recent_ingest(db=None, db_url: Optional[str] = None, hours: int = 6, limit: int = 10):
+    """Fetch recent articles (default last 6 hours)."""
+    from sqlalchemy.orm import Session
+
+    if isinstance(db, Session):
+        engine = db.get_bind()
+        db_url = str(engine.url)
+    elif not db_url:
+        raise ValueError("Either db (Session) or db_url must be provided")
+
     req = IngestRequest(
         source="google",
         limit=limit,
