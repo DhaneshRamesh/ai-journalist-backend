@@ -1,54 +1,56 @@
+# env.py
 from __future__ import annotations
 
 import os
 import sys
 from logging.config import fileConfig
-from configparser import ConfigParser
+
+from sqlalchemy import create_engine, pool
 from alembic import context
-from sqlalchemy import engine_from_config, pool
 
-# ─────────────────────────────────────────────────────────────
-# Make project importable in both local and Azure App Service
-# ─────────────────────────────────────────────────────────────
-sys.path.append(os.getcwd())  # App Service runtime
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))  # fallback
+# ----------------------------------------------------------------------
+# Make the project importable both locally and in Azure App Service
+# ----------------------------------------------------------------------
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, PROJECT_ROOT)
 
-# ─────────────────────────────────────────────────────────────
-# Alembic Config — disable interpolation to fix '%' in Azure passwords
-# ─────────────────────────────────────────────────────────────
-parser = ConfigParser(interpolation=None)
-parser.read(os.path.join(os.path.dirname(__file__), "..", "alembic.ini"))
-
+# ----------------------------------------------------------------------
+# Alembic Config & Logging
+# ----------------------------------------------------------------------
 config = context.config
-config.file_config = parser  # override interpolation handling
 
-# Configure logging if alembic.ini exists
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# ─────────────────────────────────────────────────────────────
-# Import metadata (ensure Base + models are imported)
-# ─────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
+# Import models and metadata
+# ----------------------------------------------------------------------
+# pylint: disable=wrong-import-position
 from src.db.base import Base  # noqa: E402
-from src.db import models     # noqa: F401  # register tables
+from src.db import models    # noqa: F401, E402
+
 target_metadata = Base.metadata
 
-# ─────────────────────────────────────────────────────────────
-# Resolve database URL dynamically (Azure or local)
-# ─────────────────────────────────────────────────────────────
-DB_URL_ENV = os.getenv("DATABASE_URL")
-
+# ----------------------------------------------------------------------
+# Resolve DATABASE_URL
+# ----------------------------------------------------------------------
 def _resolve_url() -> str:
-    """Prefer DATABASE_URL (prod/Azure). If missing, fall back to SQLite."""
-    if DB_URL_ENV:
-        return DB_URL_ENV
+    """
+    Return the database URL.
+
+    1. Explicit env-var `DATABASE_URL` (Azure, Docker, CI, etc.)
+    2. Fallback to a local SQLite file for quick dev iterations.
+    """
+    url = os.getenv("DATABASE_URL")
+    if url:
+        return url
     return "sqlite:///./dev.db"
 
-# ─────────────────────────────────────────────────────────────
-# Migration runners
-# ─────────────────────────────────────────────────────────────
+
+# ----------------------------------------------------------------------
+# Offline migrations
+# ----------------------------------------------------------------------
 def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode'."""
     url = _resolve_url()
     context.configure(
         url=url,
@@ -58,31 +60,46 @@ def run_migrations_offline() -> None:
         compare_server_default=True,
         dialect_opts={"paramstyle": "named"},
     )
+
     with context.begin_transaction():
         context.run_migrations()
 
-def run_migrations_online() -> None:
-    """Run migrations in 'online' mode'."""
-    url = _resolve_url()
-    config.set_main_option("sqlalchemy.url", url)
 
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
+# ----------------------------------------------------------------------
+# Online migrations
+# ----------------------------------------------------------------------
+def run_migrations_online() -> None:
+    url = _resolve_url()
+
+    # Azure PostgreSQL/MySQL connections benefit from a real pool,
+    # but keep NullPool for Alembic to avoid connection-leak issues.
+    connect_args: dict = {}
+    if url.startswith("postgresql"):
+        # Azure PostgreSQL requires SSL by default
+        connect_args["sslmode"] = os.getenv("DB_SSLMODE", "require")
+
+    engine = create_engine(
+        url,
         poolclass=pool.NullPool,
         future=True,
+        connect_args=connect_args,
     )
 
-    with connectable.connect() as connection:
+    with engine.connect() as connection:
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
             compare_type=True,
             compare_server_default=True,
         )
+
         with context.begin_transaction():
             context.run_migrations()
 
+
+# ----------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------
 if context.is_offline_mode():
     run_migrations_offline()
 else:
