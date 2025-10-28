@@ -11,13 +11,14 @@ from typing import Optional, Dict, Any, List, NamedTuple
 
 import requests
 import feedparser
-from sqlalchemy.orm import Session
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy import create_engine, func
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy import create_engine
 from pydantic import BaseModel, validator
 from dataclasses import dataclass
 
+# ----------------------------------------------------------------------
 # Project imports
+# ----------------------------------------------------------------------
 from src.db import models
 from src.processing.summarizer import summarize_text
 from src.processing.sentiment import _analyze_sentiment
@@ -41,7 +42,7 @@ class Config:
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
-    timeout: int = 12
+    timeout: int = 10
     per_keyword_limit: int = 5
     batch_commit_size: int = 10
     max_summary_length: int = 500
@@ -51,7 +52,7 @@ class Config:
 config = Config()
 
 # ----------------------------------------------------------------------
-# Models
+# Pydantic / NamedTuple models
 # ----------------------------------------------------------------------
 class IngestStats(NamedTuple):
     articles_inserted: int = 0
@@ -82,7 +83,7 @@ class IngestRequest(BaseModel):
         return v
 
 # ----------------------------------------------------------------------
-# Utilities
+# Helper utilities
 # ----------------------------------------------------------------------
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -95,6 +96,7 @@ def _filtered_kwargs(data: dict, model) -> dict:
     return {k: v for k, v in data.items() if k in cols}
 
 def _unique_key_name() -> str:
+    """Return 'url' if the Article table has it, otherwise 'link'."""
     cols = _model_columns(models.Article)
     return "url" if "url" in cols else "link"
 
@@ -106,7 +108,7 @@ def _domain_from_url(url: str) -> str:
     try:
         return urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
     except Exception:
-        return ""
+        return "unknown"
 
 def _resolve_keywords(req_keywords: Optional[List[str]] = None) -> List[str]:
     if req_keywords:
@@ -119,7 +121,7 @@ def _resolve_keywords(req_keywords: Optional[List[str]] = None) -> List[str]:
     return ["AI", "journalism", "startups"]
 
 # ----------------------------------------------------------------------
-# Rate limiting
+# Rate-limiting decorator
 # ----------------------------------------------------------------------
 def rate_limit(calls_per_minute: int | None = None):
     calls_per_minute = calls_per_minute or config.calls_per_minute
@@ -141,9 +143,9 @@ def rate_limit(calls_per_minute: int | None = None):
 # ----------------------------------------------------------------------
 # RSS fetching & parsing
 # ----------------------------------------------------------------------
-def _google_news_rss_url(query: str, hl: str = "en-US", gl: str = "US", ceid: str = "US:en") -> str:
+def _google_news_rss_url(query: str) -> str:
     q = urllib.parse.quote_plus(query)
-    return f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
+    return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
 @rate_limit()
 def _fetch_feed(url: str) -> Optional[feedparser.FeedParserDict]:
@@ -151,8 +153,8 @@ def _fetch_feed(url: str) -> Optional[feedparser.FeedParserDict]:
         r = requests.get(url, headers={"User-Agent": config.user_agent}, timeout=config.timeout)
         r.raise_for_status()
         return feedparser.parse(r.content)
-    except Exception as exc:
-        logger.error(f"Failed to fetch {url!r}: {exc}")
+    except Exception as e:
+        logger.warning(f"RSS fetch failed for {url}: {e}")
         return None
 
 def _parse_published(entry) -> Optional[datetime]:
@@ -173,103 +175,76 @@ def _parse_published(entry) -> Optional[datetime]:
             pass
     return None
 
-def _entry_to_article_dict(entry, unique_key: str) -> Dict[str, Any]:
+def _entry_to_article(entry, unique_key: str) -> dict:
     title = getattr(entry, "title", "") or "(untitled)"
-    link = getattr(entry, "link", "") or ""
-    published = _parse_published(entry)
+    link = getattr(entry, "link", "")
+    snippet = getattr(entry, "summary", "")
+    source = getattr(getattr(entry, "source", None), "title", "") or _domain_from_url(link)
 
-    source = ""
-    if hasattr(entry, "source"):
-        try:
-            src = entry.source
-            source = src.get("title") if isinstance(src, dict) else getattr(src, "title", "")
-        except Exception:
-            pass
-    if not source:
-        source = _domain_from_url(link)
-
-    snippet = getattr(entry, "summary", "") or ""
-    payload = {
+    return {
         "title": title,
         "source": source,
-        "published": published,
         "raw_text": snippet,
+        "published": _parse_published(entry),
         "fetched_at": _utcnow(),
+        unique_key: link,
     }
-    payload[unique_key] = link
-    return payload
 
 def _should_include(adata: dict, since_utc: datetime) -> bool:
-    pub = adata.get("published")
-    if pub and pub < since_utc:
+    if adata.get("published") and adata["published"] < since_utc:
         return False
 
     content = (adata.get("raw_text") or "") + (adata.get("title") or "")
-    if len(content.strip()) < config.min_article_length:
+    if len(content) < config.min_article_length:
         return False
 
-    skip = {"read more", "continue reading", "loading...", "advertisement"}
-    if any(p in content.lower() for p in skip):
-        return False
-
-    return True
+    skip = {"read more", "continue reading", "advertisement"}
+    return not any(s in (adata.get("raw_text") or "").lower() for s in skip)
 
 # ----------------------------------------------------------------------
 # Core fetching
 # ----------------------------------------------------------------------
-def _fetch_for_keyword(
-    kw: str,
-    per_kw_limit: int,
-    unique_key: str,
-    since_utc: datetime,
-) -> List[dict]:
-    logger.debug(f"Fetching for keyword: {kw!r}")
-    feed = _fetch_feed(_google_news_rss_url(kw))
-    if not feed or not getattr(feed, "entries", []):
-        logger.warning(f"No entries for keyword {kw!r}")
-        return []
-
-    collected = []
-    for entry in feed.entries[:per_kw_limit]:
-        adata = _entry_to_article_dict(entry, unique_key)
-        if _should_include(adata, since_utc):
-            collected.append(adata)
-    return collected
-
-def _fetch_and_filter(
+def _fetch_articles(
     keywords: List[str],
     total_limit: int,
     since_utc: datetime,
     per_keyword_limit: int,
 ) -> List[dict]:
     unique_key = _unique_key_name()
-    all_articles: List[dict] = []
+    all_entries: List[dict] = []
 
     for kw in keywords:
-        batch = _fetch_for_keyword(kw, per_keyword_limit, unique_key, since_utc)
-        all_articles.extend(batch)
-        if len(all_articles) >= total_limit:
+        feed = _fetch_feed(_google_news_rss_url(kw))
+        if not feed or not getattr(feed, "entries", []):
+            continue
+
+        for entry in feed.entries[:per_keyword_limit]:
+            adata = _entry_to_article(entry, unique_key)
+            if _should_include(adata, since_utc):
+                all_entries.append(adata)
+
+        if len(all_entries) >= total_limit:
             break
 
-    random.shuffle(all_articles)
-    return all_articles[:total_limit]
+    random.shuffle(all_entries)
+    return all_entries[:total_limit]
 
 # ----------------------------------------------------------------------
-# DB operations
+# DB upserts
 # ----------------------------------------------------------------------
 def _upsert_article(db: Session, data: dict) -> models.Article:
     """
     Insert a new Article or update an existing one.
-    Deduplication is performed on the column returned by `_unique_key_name()`.
+    Deduplication uses the column returned by ``_unique_key_name()``.
     """
-    unique_key = _unique_key_name()
-    link = data.get(unique_key)
-    if not link:
+    key = _unique_key_name()
+    value = data.get(key)
+    if not value:
         raise ValueError("Article payload missing unique key")
 
-    existing = _article_by_unique(db, unique_key, link)
+    existing = _article_by_unique(db, key, value)
     if existing:
-        # UPDATE
+        # ---- UPDATE ----
         for k, v in data.items():
             if hasattr(existing, k):
                 setattr(existing, k, v)
@@ -279,14 +254,14 @@ def _upsert_article(db: Session, data: dict) -> models.Article:
         db.refresh(existing)
         return existing
 
-    # INSERT
+    # ---- INSERT ----
     article = models.Article(**_filtered_kwargs(data, models.Article))
     db.add(article)
     db.commit()
     db.refresh(article)
     return article
 
-def _insert_mention(db: Session, article: models.Article) -> models.Mention:
+def _insert_mention(db: Session, article: models.Article) -> None:
     content = (article.raw_text or "") + (article.title or "")
     summary = summarize_text(content)[: config.max_summary_length]
     sentiment, score = _analyze_sentiment(content)
@@ -297,87 +272,98 @@ def _insert_mention(db: Session, article: models.Article) -> models.Mention:
         "summary": summary,
         "sentiment": sentiment,
         "risk_score": risk,
-        "named_entities": "(placeholder)",   # replace with real NER later
+        "named_entities": "(placeholder)",
         "created_at": _utcnow(),
     }
     mention = models.Mention(**_filtered_kwargs(payload, models.Mention))
     db.add(mention)
-    return mention
 
 # ----------------------------------------------------------------------
-# Main ingestion function (called by your API)
+# Public entry-point
 # ----------------------------------------------------------------------
 def ingest_google_news(request: IngestRequest, db_url: str) -> IngestStats:
     """
-    Main ingestion routine.
-
-    * Resolves keywords (request → env → defaults)
-    * Fetches RSS feeds, filters, deduplicates
-    * Upserts Articles + creates a Mention per article
-    * Returns structured stats
+    Main ingestion routine – called from your FastAPI endpoint.
     """
-    engine = create_engine(db_url, future=True)
     stats = IngestStats()
     keywords = _resolve_keywords(request.keywords)
     per_kw = request.per_keyword_limit or config.per_keyword_limit
 
-    logger.info(f"🚀 Starting ingestion: source={request.source}, limit={request.limit}, keywords={keywords}")
-
-    articles = _fetch_and_filter(
-        keywords=keywords,
-        total_limit=request.limit,
-        since_utc=request.since_utc,
-        per_keyword_limit=per_kw,
+    logger.info(
+        f"Starting ingestion: source={request.source}, limit={request.limit}, "
+        f"keywords={keywords}"
     )
-    stats = stats._replace(fetched=len(articles), keywords_processed=len(keywords))
-    logger.info(f"📊 Fetched {len(articles)} articles from {len(keywords)} keywords")
 
-    if request.dry_run:
-        logger.info(f"[DRY-RUN] Would process {len(articles)} articles.")
+    articles = _fetch_articles(keywords, request.limit, request.since_utc, per_kw)
+    stats = stats._replace(fetched=len(articles), keywords_processed=len(keywords))
+    logger.info(f"Fetched {len(articles)} articles from {len(keywords)} keywords")
+
+    if request.dry_run or not articles:
         return stats
 
-    with engine.begin() as conn:
-        batch = []
+    # ------------------------------------------------------------------
+    # DB session with a modest connection pool (works for Azure Postgres)
+    # ------------------------------------------------------------------
+    engine = create_engine(
+        db_url,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=10,
+        pool_timeout=10,
+        future=True,
+    )
+    SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    db = SessionLocal()
+
+    try:
+        batch_counter = 0
         for i, adata in enumerate(articles):
             try:
-                article = _upsert_article(conn, adata)
-                # Check if it was insert or update
-                if not _article_by_unique(conn, _unique_key_name(), adata[_unique_key_name()]):
-                    stats = stats._replace(articles_inserted=stats.articles_inserted + 1)
-                else:
-                    stats = stats._replace(articles_updated=stats.articles_updated + 1)
+                article = _upsert_article(db, adata)
 
-                mention = _insert_mention(conn, article)
+                # Detect insert vs update
+                if _article_by_unique(db, _unique_key_name(), adata[_unique_key_name()]):
+                    stats = stats._replace(articles_updated=stats.articles_updated + 1)
+                else:
+                    stats = stats._replace(articles_inserted=stats.articles_inserted + 1)
+
+                _insert_mention(db, article)
                 stats = stats._replace(mentions_inserted=stats.mentions_inserted + 1)
 
-                batch.append((article, mention))
-                if len(batch) >= config.batch_commit_size:
-                    conn.commit()
-                    batch.clear()
+                batch_counter += 1
+                if batch_counter >= config.batch_commit_size:
+                    db.commit()
+                    batch_counter = 0
 
             except Exception as exc:
-                logger.error(f"❌ Error processing article {i}: {exc}")
+                logger.error(f"Error processing article {i}: {exc}")
+                db.rollback()
                 stats = stats._replace(errors=stats.errors + 1)
-                conn.rollback()
-                continue
 
-        if batch:
-            conn.commit()
+        if batch_counter:
+            db.commit()
 
-    logger.info(f"✅ Ingestion complete: {stats.articles_inserted} new articles, {stats.mentions_inserted} mentions")
+    finally:
+        db.close()
+
+    logger.info(
+        f"Ingestion complete → inserted {stats.articles_inserted}, "
+        f"updated {stats.articles_updated}, mentions {stats.mentions_inserted}, "
+        f"errors {stats.errors}"
+    )
     return stats
 
 # ----------------------------------------------------------------------
-# CLI for testing (optional)
+# CLI for local testing
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Google News ingester")
-    parser.add_argument("--db", required=True, help="DB URL")
+    parser = argparse.ArgumentParser(description="Google News ingester (local test)")
+    parser.add_argument("--db", default=os.getenv("DATABASE_URL", "sqlite:///dev.db"))
     parser.add_argument("--limit", type=int, default=10)
-    parser.add_argument("--hours", type=int, default=6)
-    parser.add_argument("--keywords", nargs="+", default=["Pakistan"])
+    parser.add_argument("--hours", type=int, default=12)
+    parser.add_argument("--keywords", nargs="+", default=["UNSW"])
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -388,5 +374,5 @@ if __name__ == "__main__":
         dry_run=args.dry_run,
         keywords=args.keywords,
     )
-    stats = ingest_google_news(req, args.db)
-    print(stats._asdict())
+    result = ingest_google_news(req, args.db)
+    print(result._asdict())
