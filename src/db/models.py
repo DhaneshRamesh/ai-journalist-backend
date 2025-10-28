@@ -1,6 +1,14 @@
 from sqlalchemy import (
-    Column, Integer, String, DateTime, Text, ForeignKey,
-    CheckConstraint, Index
+    Column,
+    Integer,
+    String,
+    DateTime,
+    Text,
+    ForeignKey,
+    CheckConstraint,
+    Index,
+    Boolean,
+    text,
 )
 from sqlalchemy.orm import relationship
 from .base import Base
@@ -25,7 +33,7 @@ class Article(Base):
     mentions = relationship(
         "Mention",
         back_populates="article",
-        cascade="all, delete-orphan"
+        cascade="all, delete-orphan",
     )
 
 
@@ -34,22 +42,36 @@ class Mention(Base):
 
     id = Column(Integer, primary_key=True)
     article_id = Column(Integer, ForeignKey("articles.id", ondelete="CASCADE"), nullable=False)
+
     summary = Column(Text, nullable=False)
+
     sentiment = Column(
         String(16),
         default="neutral",
-        nullable=False
-    )
-    # Valid values enforced by app logic; add DB CHECK if you like:
-    __table_args__ = (
-        CheckConstraint("sentiment IN ('positive','negative','neutral')", name="ck_mentions_sentiment"),
+        nullable=False,
     )
 
-    risk_score = Column(Integer, default=0, nullable=False)  # integer per your schema
+    # Moderation / ops fields (backward compatible with server defaults)
+    flagged = Column(Boolean, nullable=False, server_default=text("false"))
+    flag_reason = Column(String(128), nullable=True)
+    flagged_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Risk / NLP outputs
+    risk_score = Column(Integer, default=0, nullable=False)  # integer per schema
     named_entities = Column(Text)
+
     created_at = Column(DateTime(timezone=True), default=utcnow, index=True, nullable=False)
 
     article = relationship("Article", back_populates="mentions")
+
+    __table_args__ = (
+        CheckConstraint(
+            "sentiment IN ('positive','negative','neutral')",
+            name="ck_mentions_sentiment",
+        ),
+        # Helps dashboard queries like /mentions?flagged=true order by created_at
+        Index("ix_mentions_flagged_created", "flagged", "created_at"),
+    )
 
 
 class Journalist(Base):
