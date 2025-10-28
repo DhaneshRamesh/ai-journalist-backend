@@ -57,11 +57,10 @@ config = Config()
 # ----------------------------------------------------------------------
 class IngestStats(NamedTuple):
     articles_inserted: int = 0
-    articles_updated: int = 0
     mentions_inserted: int = 0
-    keywords_processed: int = 0
     errors: int = 0
     fetched: int = 0
+    keywords_processed: int = 0
 
 
 class IngestRequest(BaseModel):
@@ -71,19 +70,6 @@ class IngestRequest(BaseModel):
     dry_run: bool = False
     keywords: Optional[List[str]] = None
     per_keyword_limit: Optional[int] = None
-
-    @validator("limit")
-    def limit_positive(cls, v):
-        if v < 1:
-            raise ValueError("limit must be >= 1")
-        return v
-
-    @validator("per_keyword_limit")
-    def per_kw_positive(cls, v):
-        if v is not None and v < 1:
-            raise ValueError("per_keyword_limit must be >= 1")
-        return v
-
 
 # ----------------------------------------------------------------------
 # Helpers
@@ -102,7 +88,6 @@ def _filtered_kwargs(data: dict, model) -> dict:
 
 
 def _unique_key_name() -> str:
-    """Return 'url' if the Article table has it, otherwise 'link'."""
     cols = _model_columns(models.Article)
     return "url" if "url" in cols else "link"
 
@@ -122,11 +107,9 @@ def _domain_from_url(url: str) -> str:
 def _resolve_keywords(req_keywords: Optional[List[str]] = None) -> List[str]:
     if req_keywords:
         return [k.strip() for k in req_keywords if k.strip()]
-
     env = os.getenv("INGEST_KEYWORDS", "").strip()
     if env:
         return [k.strip() for k in env.split(",") if k.strip()]
-
     return ["AI", "journalism", "startups"]
 
 
@@ -146,9 +129,7 @@ def rate_limit(calls_per_minute: int | None = None):
             ret = fn(*args, **kwargs)
             last_called[0] = time.time()
             return ret
-
         return wrapper
-
     return decorator
 
 
@@ -178,7 +159,6 @@ def _parse_published(entry) -> Optional[datetime]:
             return datetime(*ts[:6], tzinfo=timezone.utc)
         except Exception:
             pass
-
     txt = getattr(entry, "published", None) or getattr(entry, "updated", None)
     if txt:
         try:
@@ -195,7 +175,6 @@ def _entry_to_article(entry, unique_key: str) -> dict:
     link = getattr(entry, "link", "")
     snippet = getattr(entry, "summary", "")
     source = getattr(getattr(entry, "source", None), "title", "") or _domain_from_url(link)
-
     return {
         "title": title,
         "source": source,
@@ -209,40 +188,29 @@ def _entry_to_article(entry, unique_key: str) -> dict:
 def _should_include(adata: dict, since_utc: datetime) -> bool:
     if adata.get("published") and adata["published"] < since_utc:
         return False
-
     content = (adata.get("raw_text") or "") + (adata.get("title") or "")
     if len(content) < config.min_article_length:
         return False
-
     skip = {"read more", "continue reading", "advertisement"}
     return not any(s in (adata.get("raw_text") or "").lower() for s in skip)
 
 
 # ----------------------------------------------------------------------
-# Fetch loop
+# Fetch articles
 # ----------------------------------------------------------------------
-def _fetch_articles(
-    keywords: List[str],
-    total_limit: int,
-    since_utc: datetime,
-    per_keyword_limit: int,
-) -> List[dict]:
+def _fetch_articles(keywords: List[str], total_limit: int, since_utc: datetime, per_keyword_limit: int) -> List[dict]:
     unique_key = _unique_key_name()
     all_entries: List[dict] = []
-
     for kw in keywords:
         feed = _fetch_feed(_google_news_rss_url(kw))
         if not feed or not getattr(feed, "entries", []):
             continue
-
         for entry in feed.entries[:per_keyword_limit]:
             adata = _entry_to_article(entry, unique_key)
             if _should_include(adata, since_utc):
                 all_entries.append(adata)
-
         if len(all_entries) >= total_limit:
             break
-
     random.shuffle(all_entries)
     return all_entries[:total_limit]
 
@@ -279,7 +247,6 @@ def _insert_mention(db: Session, article: models.Article) -> None:
     summary = summarize_text(content)[: config.max_summary_length]
     sentiment, score = _analyze_sentiment(content)
     risk = risk_score(content, score)
-
     payload = {
         "article_id": article.id,
         "summary": summary,
@@ -293,131 +260,95 @@ def _insert_mention(db: Session, article: models.Article) -> None:
 
 
 # ----------------------------------------------------------------------
-# Core function
+# Core ingest logic
 # ----------------------------------------------------------------------
-def ingest_google_news(request: IngestRequest, db_url: str) -> IngestStats:
+def ingest_google_news(source: str, keywords: List[str], db_url: str, limit: int, since_utc: datetime, per_kw: int, dry_run: bool = False) -> Dict[str, Any]:
     stats = IngestStats()
-    keywords = _resolve_keywords(request.keywords)
-    per_kw = request.per_keyword_limit or config.per_keyword_limit
-
-    logger.info(
-        f"Starting ingestion: source={request.source}, limit={request.limit}, keywords={keywords}"
-    )
-
-    articles = _fetch_articles(keywords, request.limit, request.since_utc, per_kw)
+    articles = _fetch_articles(keywords, limit, since_utc, per_kw)
     stats = stats._replace(fetched=len(articles), keywords_processed=len(keywords))
-    logger.info(f"Fetched {len(articles)} articles from {len(keywords)} keywords")
 
-    if request.dry_run or not articles:
-        return stats
+    if dry_run or not articles:
+        return {"status": "ok", "message": "Dry run or no articles found", "stats": stats._asdict()}
 
-    engine = create_engine(
-        db_url,
-        pool_pre_ping=True,
-        pool_size=5,
-        max_overflow=10,
-        pool_timeout=10,
-        future=True,
-    )
+    engine = create_engine(db_url, pool_pre_ping=True, pool_size=5, max_overflow=10, future=True)
     SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     db = SessionLocal()
 
     try:
-        batch_counter = 0
-        for i, adata in enumerate(articles):
+        for adata in articles:
             try:
-                article = _upsert_article(db, adata)
-                _insert_mention(db, article)
+                art = _upsert_article(db, adata)
+                _insert_mention(db, art)
                 stats = stats._replace(
                     articles_inserted=stats.articles_inserted + 1,
                     mentions_inserted=stats.mentions_inserted + 1,
                 )
-
-                batch_counter += 1
-                if batch_counter >= config.batch_commit_size:
-                    db.commit()
-                    batch_counter = 0
-
             except Exception as exc:
-                logger.error(f"Error processing article {i}: {exc}")
                 db.rollback()
+                logger.error(f"Error: {exc}")
                 stats = stats._replace(errors=stats.errors + 1)
-
-        if batch_counter:
-            db.commit()
-
+        db.commit()
     finally:
         db.close()
 
-    logger.info(
-        f"Ingestion complete → inserted {stats.articles_inserted}, "
-        f"mentions {stats.mentions_inserted}, errors {stats.errors}"
-    )
-    return stats
+    return {"status": "ok", "message": "Ingestion complete", "stats": stats._asdict()}
 
 
 # ----------------------------------------------------------------------
-# Backward-compatible wrappers for FastAPI routes (accept db Session)
+# Wrappers matching routes.py
 # ----------------------------------------------------------------------
-def run_ingest(db=None, db_url: Optional[str] = None, keywords: Optional[List[str]] = None, limit: int = 10):
-    """Wrapper compatible with FastAPI route calls (db=Session or db_url=str)."""
-    from sqlalchemy.orm import Session
-
-    if isinstance(db, Session):
-        engine = db.get_bind()
-        db_url = str(engine.url)
-    elif not db_url:
-        raise ValueError("Either db (Session) or db_url must be provided")
-
-    req = IngestRequest(
-        source="google",
-        limit=limit,
-        since_utc=_utcnow() - timedelta(hours=12),
-        dry_run=False,
-        keywords=keywords or _resolve_keywords(),
-    )
-    return ingest_google_news(req, db_url)
+def run_ingest(
+    db: Session,
+    source: str,
+    limit: int,
+    since_utc: datetime,
+    keywords: Optional[List[str]] = None,
+    per_keyword_limit: int = 5,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Used by /api/ingest"""
+    engine = db.get_bind()
+    db_url = str(engine.url)
+    kw = _resolve_keywords(keywords)
+    return ingest_google_news(source, kw, db_url, limit, since_utc, per_keyword_limit, dry_run)
 
 
-def run_recent_ingest(db=None, db_url: Optional[str] = None, hours: int = 6, limit: int = 10):
-    """Fetch recent articles (default last 6 hours)."""
-    from sqlalchemy.orm import Session
-
-    if isinstance(db, Session):
-        engine = db.get_bind()
-        db_url = str(engine.url)
-    elif not db_url:
-        raise ValueError("Either db (Session) or db_url must be provided")
-
-    req = IngestRequest(
-        source="google",
-        limit=limit,
-        since_utc=_utcnow() - timedelta(hours=hours),
-        dry_run=False,
-    )
-    return ingest_google_news(req, db_url)
+def run_recent_ingest(
+    db: Session,
+    limit: int = 10,
+    keywords: Optional[List[str]] = None,
+    per_keyword_limit: int = 5,
+    hours_back: int = 24,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Used by /api/ingest/params"""
+    engine = db.get_bind()
+    db_url = str(engine.url)
+    since_utc = _utcnow() - timedelta(hours=hours_back)
+    kw = _resolve_keywords(keywords)
+    return ingest_google_news("google", kw, db_url, limit, since_utc, per_keyword_limit, dry_run)
 
 
 # ----------------------------------------------------------------------
-# CLI for local testing
+# CLI for local test
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Google News ingester (local test)")
+    parser = argparse.ArgumentParser(description="Google News Ingestion")
     parser.add_argument("--db", default=os.getenv("DATABASE_URL", "sqlite:///dev.db"))
-    parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--keywords", nargs="+", default=["AI"])
+    parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--hours", type=int, default=12)
-    parser.add_argument("--keywords", nargs="+", default=["UNSW"])
-    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    req = IngestRequest(
-        source="google",
-        limit=args.limit,
-        since_utc=_utcnow() - timedelta(hours=args.hours),
-        dry_run=args.dry_run,
-        keywords=args.keywords,
+    result = ingest_google_news(
+        "google",
+        args.keywords,
+        args.db,
+        args.limit,
+        _utcnow() - timedelta(hours=args.hours),
+        per_kw=5,
+        dry_run=False,
     )
-    result = ingest_google_news(req, args.db)
-    print(result._asdict())
+    print(result)
