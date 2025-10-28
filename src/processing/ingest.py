@@ -1,4 +1,4 @@
-# src/ingest/google_news_ingester.py
+# src/processing/ingest.py
 from __future__ import annotations
 
 import os
@@ -6,7 +6,7 @@ import time
 import random
 import logging
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List, NamedTuple
 
 import requests
@@ -15,10 +15,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import create_engine, func
 from pydantic import BaseModel, validator
+from dataclasses import dataclass
 
-# ----------------------------------------------------------------------
-# Project imports (adjust the relative path to match your layout)
-# ----------------------------------------------------------------------
+# Project imports
 from src.db import models
 from src.processing.summarizer import summarize_text
 from src.processing.sentiment import _analyze_sentiment
@@ -34,10 +33,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------
-# Configuration (dataclass – easy to override via env vars later)
+# Configuration
 # ----------------------------------------------------------------------
-from dataclasses import dataclass
-
 @dataclass
 class Config:
     user_agent: str = (
@@ -49,12 +46,12 @@ class Config:
     batch_commit_size: int = 10
     max_summary_length: int = 500
     min_article_length: int = 50
-    calls_per_minute: int = 30          # Google News is generous, but keep it polite
+    calls_per_minute: int = 30
 
 config = Config()
 
 # ----------------------------------------------------------------------
-# Pydantic / NamedTuple models
+# Models
 # ----------------------------------------------------------------------
 class IngestStats(NamedTuple):
     articles_inserted: int = 0
@@ -85,7 +82,7 @@ class IngestRequest(BaseModel):
         return v
 
 # ----------------------------------------------------------------------
-# Helper utilities
+# Utilities
 # ----------------------------------------------------------------------
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -98,7 +95,6 @@ def _filtered_kwargs(data: dict, model) -> dict:
     return {k: v for k, v in data.items() if k in cols}
 
 def _unique_key_name() -> str:
-    """Return the column that uniquely identifies an Article (url or link)."""
     cols = _model_columns(models.Article)
     return "url" if "url" in cols else "link"
 
@@ -113,7 +109,6 @@ def _domain_from_url(url: str) -> str:
         return ""
 
 def _resolve_keywords(req_keywords: Optional[List[str]] = None) -> List[str]:
-    """Fallback chain: request → env var → hard-coded defaults."""
     if req_keywords:
         return [k.strip() for k in req_keywords if k.strip()]
 
@@ -124,7 +119,7 @@ def _resolve_keywords(req_keywords: Optional[List[str]] = None) -> List[str]:
     return ["AI", "journalism", "startups"]
 
 # ----------------------------------------------------------------------
-# Rate limiting decorator (simple token-bucket style)
+# Rate limiting
 # ----------------------------------------------------------------------
 def rate_limit(calls_per_minute: int | None = None):
     calls_per_minute = calls_per_minute or config.calls_per_minute
@@ -161,7 +156,6 @@ def _fetch_feed(url: str) -> Optional[feedparser.FeedParserDict]:
         return None
 
 def _parse_published(entry) -> Optional[datetime]:
-    # 1. struct_time from feedparser
     if getattr(entry, "published_parsed", None):
         try:
             ts = entry.published_parsed
@@ -169,7 +163,6 @@ def _parse_published(entry) -> Optional[datetime]:
         except Exception:
             pass
 
-    # 2. RFC-2822 string
     txt = getattr(entry, "published", None) or getattr(entry, "updated", None)
     if txt:
         try:
@@ -185,7 +178,6 @@ def _entry_to_article_dict(entry, unique_key: str) -> Dict[str, Any]:
     link = getattr(entry, "link", "") or ""
     published = _parse_published(entry)
 
-    # Source extraction – Google News wraps original feed inside <source>
     source = ""
     if hasattr(entry, "source"):
         try:
@@ -223,7 +215,7 @@ def _should_include(adata: dict, since_utc: datetime) -> bool:
     return True
 
 # ----------------------------------------------------------------------
-# Core fetching logic
+# Core fetching
 # ----------------------------------------------------------------------
 def _fetch_for_keyword(
     kw: str,
@@ -263,12 +255,12 @@ def _fetch_and_filter(
     return all_articles[:total_limit]
 
 # ----------------------------------------------------------------------
-# DB upserts (articles + mentions)
+# DB operations
 # ----------------------------------------------------------------------
 def _upsert_article(db: Session, data: dict) -> models.Article:
     """
     Insert a new Article or update an existing one.
-    Deduplication is performed on the column returned by ``_unique_key_name()``.
+    Deduplication is performed on the column returned by `_unique_key_name()`.
     """
     unique_key = _unique_key_name()
     link = data.get(unique_key)
@@ -277,7 +269,7 @@ def _upsert_article(db: Session, data: dict) -> models.Article:
 
     existing = _article_by_unique(db, unique_key, link)
     if existing:
-        # UPDATE path
+        # UPDATE
         for k, v in data.items():
             if hasattr(existing, k):
                 setattr(existing, k, v)
@@ -287,7 +279,7 @@ def _upsert_article(db: Session, data: dict) -> models.Article:
         db.refresh(existing)
         return existing
 
-    # INSERT path
+    # INSERT
     article = models.Article(**_filtered_kwargs(data, models.Article))
     db.add(article)
     db.commit()
@@ -313,7 +305,7 @@ def _insert_mention(db: Session, article: models.Article) -> models.Mention:
     return mention
 
 # ----------------------------------------------------------------------
-# Public entry-point
+# Main ingestion function (called by your API)
 # ----------------------------------------------------------------------
 def ingest_google_news(request: IngestRequest, db_url: str) -> IngestStats:
     """
@@ -329,6 +321,8 @@ def ingest_google_news(request: IngestRequest, db_url: str) -> IngestStats:
     keywords = _resolve_keywords(request.keywords)
     per_kw = request.per_keyword_limit or config.per_keyword_limit
 
+    logger.info(f"🚀 Starting ingestion: source={request.source}, limit={request.limit}, keywords={keywords}")
+
     articles = _fetch_and_filter(
         keywords=keywords,
         total_limit=request.limit,
@@ -336,16 +330,18 @@ def ingest_google_news(request: IngestRequest, db_url: str) -> IngestStats:
         per_keyword_limit=per_kw,
     )
     stats = stats._replace(fetched=len(articles), keywords_processed=len(keywords))
+    logger.info(f"📊 Fetched {len(articles)} articles from {len(keywords)} keywords")
 
     if request.dry_run:
         logger.info(f"[DRY-RUN] Would process {len(articles)} articles.")
         return stats
 
-    with engine.begin() as conn:          # one transaction for the whole batch
+    with engine.begin() as conn:
         batch = []
-        for adata in articles:
+        for i, adata in enumerate(articles):
             try:
                 article = _upsert_article(conn, adata)
+                # Check if it was insert or update
                 if not _article_by_unique(conn, _unique_key_name(), adata[_unique_key_name()]):
                     stats = stats._replace(articles_inserted=stats.articles_inserted + 1)
                 else:
@@ -360,41 +356,37 @@ def ingest_google_news(request: IngestRequest, db_url: str) -> IngestStats:
                     batch.clear()
 
             except Exception as exc:
-                logger.error(f"Failed to process article {adata.get('title')!r}: {exc}")
+                logger.error(f"❌ Error processing article {i}: {exc}")
                 stats = stats._replace(errors=stats.errors + 1)
                 conn.rollback()
                 continue
 
-        # final commit for remaining items
         if batch:
             conn.commit()
 
-    logger.info(
-        f"Ingestion complete → inserted {stats.articles_inserted}, "
-        f"updated {stats.articles_updated}, mentions {stats.mentions_inserted}, "
-        f"errors {stats.errors}"
-    )
+    logger.info(f"✅ Ingestion complete: {stats.articles_inserted} new articles, {stats.mentions_inserted} mentions")
     return stats
 
 # ----------------------------------------------------------------------
-# Example CLI (optional – useful for local testing or Azure startup script)
+# CLI for testing (optional)
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
-    from datetime import timedelta
 
-    parser = argparse.ArgumentParser(description="Google News → DB ingester")
-    parser.add_argument("--db", required=True, help="SQLAlchemy DB URL")
-    parser.add_argument("--limit", type=int, default=20)
-    parser.add_argument("--hours", type=int, default=6, help="Look-back window in hours")
+    parser = argparse.ArgumentParser(description="Google News ingester")
+    parser.add_argument("--db", required=True, help="DB URL")
+    parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--hours", type=int, default=6)
+    parser.add_argument("--keywords", nargs="+", default=["Pakistan"])
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     req = IngestRequest(
-        source="google_news",
+        source="google",
         limit=args.limit,
         since_utc=_utcnow() - timedelta(hours=args.hours),
         dry_run=args.dry_run,
+        keywords=args.keywords,
     )
     stats = ingest_google_news(req, args.db)
     print(stats._asdict())
