@@ -49,10 +49,11 @@ class Config:
     min_article_length: int = 50
     calls_per_minute: int = 30
 
+
 config = Config()
 
 # ----------------------------------------------------------------------
-# Pydantic / NamedTuple models
+# Models
 # ----------------------------------------------------------------------
 class IngestStats(NamedTuple):
     articles_inserted: int = 0
@@ -61,6 +62,7 @@ class IngestStats(NamedTuple):
     keywords_processed: int = 0
     errors: int = 0
     fetched: int = 0
+
 
 class IngestRequest(BaseModel):
     source: str
@@ -82,33 +84,40 @@ class IngestRequest(BaseModel):
             raise ValueError("per_keyword_limit must be >= 1")
         return v
 
+
 # ----------------------------------------------------------------------
-# Helper utilities
+# Helpers
 # ----------------------------------------------------------------------
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def _model_columns(model) -> set[str]:
     return {c.key for c in model.__table__.columns}
+
 
 def _filtered_kwargs(data: dict, model) -> dict:
     cols = _model_columns(model)
     return {k: v for k, v in data.items() if k in cols}
+
 
 def _unique_key_name() -> str:
     """Return 'url' if the Article table has it, otherwise 'link'."""
     cols = _model_columns(models.Article)
     return "url" if "url" in cols else "link"
 
+
 def _article_by_unique(db: Session, key: str, value: str) -> Optional[models.Article]:
     col = getattr(models.Article, key)
     return db.query(models.Article).filter(col == value).one_or_none()
+
 
 def _domain_from_url(url: str) -> str:
     try:
         return urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
     except Exception:
         return "unknown"
+
 
 def _resolve_keywords(req_keywords: Optional[List[str]] = None) -> List[str]:
     if req_keywords:
@@ -120,8 +129,9 @@ def _resolve_keywords(req_keywords: Optional[List[str]] = None) -> List[str]:
 
     return ["AI", "journalism", "startups"]
 
+
 # ----------------------------------------------------------------------
-# Rate-limiting decorator
+# Rate limiter
 # ----------------------------------------------------------------------
 def rate_limit(calls_per_minute: int | None = None):
     calls_per_minute = calls_per_minute or config.calls_per_minute
@@ -130,22 +140,25 @@ def rate_limit(calls_per_minute: int | None = None):
 
     def decorator(fn):
         def wrapper(*args, **kwargs):
-            now = time.time()
-            elapsed = now - last_called[0]
+            elapsed = time.time() - last_called[0]
             if elapsed < min_interval:
                 time.sleep(min_interval - elapsed)
             ret = fn(*args, **kwargs)
             last_called[0] = time.time()
             return ret
+
         return wrapper
+
     return decorator
 
+
 # ----------------------------------------------------------------------
-# RSS fetching & parsing
+# RSS fetching
 # ----------------------------------------------------------------------
 def _google_news_rss_url(query: str) -> str:
     q = urllib.parse.quote_plus(query)
     return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+
 
 @rate_limit()
 def _fetch_feed(url: str) -> Optional[feedparser.FeedParserDict]:
@@ -156,6 +169,7 @@ def _fetch_feed(url: str) -> Optional[feedparser.FeedParserDict]:
     except Exception as e:
         logger.warning(f"RSS fetch failed for {url}: {e}")
         return None
+
 
 def _parse_published(entry) -> Optional[datetime]:
     if getattr(entry, "published_parsed", None):
@@ -175,6 +189,7 @@ def _parse_published(entry) -> Optional[datetime]:
             pass
     return None
 
+
 def _entry_to_article(entry, unique_key: str) -> dict:
     title = getattr(entry, "title", "") or "(untitled)"
     link = getattr(entry, "link", "")
@@ -190,6 +205,7 @@ def _entry_to_article(entry, unique_key: str) -> dict:
         unique_key: link,
     }
 
+
 def _should_include(adata: dict, since_utc: datetime) -> bool:
     if adata.get("published") and adata["published"] < since_utc:
         return False
@@ -201,8 +217,9 @@ def _should_include(adata: dict, since_utc: datetime) -> bool:
     skip = {"read more", "continue reading", "advertisement"}
     return not any(s in (adata.get("raw_text") or "").lower() for s in skip)
 
+
 # ----------------------------------------------------------------------
-# Core fetching
+# Fetch loop
 # ----------------------------------------------------------------------
 def _fetch_articles(
     keywords: List[str],
@@ -229,14 +246,11 @@ def _fetch_articles(
     random.shuffle(all_entries)
     return all_entries[:total_limit]
 
+
 # ----------------------------------------------------------------------
-# DB upserts
+# DB layer
 # ----------------------------------------------------------------------
 def _upsert_article(db: Session, data: dict) -> models.Article:
-    """
-    Insert a new Article or update an existing one.
-    Deduplication uses the column returned by ``_unique_key_name()``.
-    """
     key = _unique_key_name()
     value = data.get(key)
     if not value:
@@ -244,7 +258,6 @@ def _upsert_article(db: Session, data: dict) -> models.Article:
 
     existing = _article_by_unique(db, key, value)
     if existing:
-        # ---- UPDATE ----
         for k, v in data.items():
             if hasattr(existing, k):
                 setattr(existing, k, v)
@@ -254,12 +267,12 @@ def _upsert_article(db: Session, data: dict) -> models.Article:
         db.refresh(existing)
         return existing
 
-    # ---- INSERT ----
     article = models.Article(**_filtered_kwargs(data, models.Article))
     db.add(article)
     db.commit()
     db.refresh(article)
     return article
+
 
 def _insert_mention(db: Session, article: models.Article) -> None:
     content = (article.raw_text or "") + (article.title or "")
@@ -278,20 +291,17 @@ def _insert_mention(db: Session, article: models.Article) -> None:
     mention = models.Mention(**_filtered_kwargs(payload, models.Mention))
     db.add(mention)
 
+
 # ----------------------------------------------------------------------
-# Public entry-point
+# Core function
 # ----------------------------------------------------------------------
 def ingest_google_news(request: IngestRequest, db_url: str) -> IngestStats:
-    """
-    Main ingestion routine – called from your FastAPI endpoint.
-    """
     stats = IngestStats()
     keywords = _resolve_keywords(request.keywords)
     per_kw = request.per_keyword_limit or config.per_keyword_limit
 
     logger.info(
-        f"Starting ingestion: source={request.source}, limit={request.limit}, "
-        f"keywords={keywords}"
+        f"Starting ingestion: source={request.source}, limit={request.limit}, keywords={keywords}"
     )
 
     articles = _fetch_articles(keywords, request.limit, request.since_utc, per_kw)
@@ -301,9 +311,6 @@ def ingest_google_news(request: IngestRequest, db_url: str) -> IngestStats:
     if request.dry_run or not articles:
         return stats
 
-    # ------------------------------------------------------------------
-    # DB session with a modest connection pool (works for Azure Postgres)
-    # ------------------------------------------------------------------
     engine = create_engine(
         db_url,
         pool_pre_ping=True,
@@ -321,7 +328,6 @@ def ingest_google_news(request: IngestRequest, db_url: str) -> IngestStats:
             try:
                 article = _upsert_article(db, adata)
 
-                # Detect insert vs update
                 if _article_by_unique(db, _unique_key_name(), adata[_unique_key_name()]):
                     stats = stats._replace(articles_updated=stats.articles_updated + 1)
                 else:
@@ -352,6 +358,33 @@ def ingest_google_news(request: IngestRequest, db_url: str) -> IngestStats:
         f"errors {stats.errors}"
     )
     return stats
+
+
+# ----------------------------------------------------------------------
+# Backward-compatible wrappers for FastAPI routes
+# ----------------------------------------------------------------------
+def run_ingest(db_url: str, keywords: Optional[List[str]] = None, limit: int = 10):
+    """Legacy wrapper used by FastAPI routes."""
+    req = IngestRequest(
+        source="google",
+        limit=limit,
+        since_utc=_utcnow() - timedelta(hours=12),
+        dry_run=False,
+        keywords=keywords or _resolve_keywords(),
+    )
+    return ingest_google_news(req, db_url)
+
+
+def run_recent_ingest(db_url: str, hours: int = 6, limit: int = 10):
+    """Fetch recent articles (default: last 6h)."""
+    req = IngestRequest(
+        source="google",
+        limit=limit,
+        since_utc=_utcnow() - timedelta(hours=hours),
+        dry_run=False,
+    )
+    return ingest_google_news(req, db_url)
+
 
 # ----------------------------------------------------------------------
 # CLI for local testing
