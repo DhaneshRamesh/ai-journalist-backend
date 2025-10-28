@@ -1,33 +1,45 @@
+# src/ingest/google_news_ingester.py
 from __future__ import annotations
+
 import os
 import time
-import urllib.parse
+import random
 import logging
-import re
-from datetime import datetime, timezone, timedelta
+import urllib.parse
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, NamedTuple
-from functools import wraps
-from dataclasses import dataclass
+
 import requests
 import feedparser
 from sqlalchemy.orm import Session
-from sqlalchemy import create_engine, func
 from sqlalchemy.exc import IntegrityError
-from urllib.parse import urlparse
+from sqlalchemy import create_engine, func
 from pydantic import BaseModel, validator
+
+# ----------------------------------------------------------------------
+# Project imports (adjust the relative path to match your layout)
+# ----------------------------------------------------------------------
 from src.db import models
 from src.processing.summarizer import summarize_text
 from src.processing.sentiment import _analyze_sentiment
 from src.processing.risk_detector import risk_score
 
-# Logging Setup
-logging.basicConfig(level=logging.INFO)
+# ----------------------------------------------------------------------
+# Logging
+# ----------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-# Configuration
+# ----------------------------------------------------------------------
+# Configuration (dataclass – easy to override via env vars later)
+# ----------------------------------------------------------------------
+from dataclasses import dataclass
+
 @dataclass
 class Config:
-    """Configuration for ingestion system"""
     user_agent: str = (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -37,13 +49,14 @@ class Config:
     batch_commit_size: int = 10
     max_summary_length: int = 500
     min_article_length: int = 50
-    calls_per_minute: int = 30
+    calls_per_minute: int = 30          # Google News is generous, but keep it polite
 
 config = Config()
 
-# Data Models
+# ----------------------------------------------------------------------
+# Pydantic / NamedTuple models
+# ----------------------------------------------------------------------
 class IngestStats(NamedTuple):
-    """Structured statistics for ingestion runs"""
     articles_inserted: int = 0
     articles_updated: int = 0
     mentions_inserted: int = 0
@@ -52,7 +65,6 @@ class IngestStats(NamedTuple):
     fetched: int = 0
 
 class IngestRequest(BaseModel):
-    """Validated input for ingestion"""
     source: str
     limit: int
     since_utc: datetime
@@ -60,109 +72,96 @@ class IngestRequest(BaseModel):
     keywords: Optional[List[str]] = None
     per_keyword_limit: Optional[int] = None
 
-    @validator('limit')
-    def limit_must_be_positive(cls, v):
+    @validator("limit")
+    def limit_positive(cls, v):
         if v < 1:
-            raise ValueError('limit must be >= 1')
+            raise ValueError("limit must be >= 1")
         return v
 
-    @validator('per_keyword_limit')
-    def per_kw_limit_must_be_positive(cls, v):
+    @validator("per_keyword_limit")
+    def per_kw_positive(cls, v):
         if v is not None and v < 1:
-            raise ValueError('per_keyword_limit must be >= 1')
+            raise ValueError("per_keyword_limit must be >= 1")
         return v
 
-# Utilities
+# ----------------------------------------------------------------------
+# Helper utilities
+# ----------------------------------------------------------------------
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 def _model_columns(model) -> set[str]:
     return {c.key for c in model.__table__.columns}
 
-def _filtered_kwargs(data: Dict[str, Any], model) -> Dict[str, Any]:
+def _filtered_kwargs(data: dict, model) -> dict:
     cols = _model_columns(model)
     return {k: v for k, v in data.items() if k in cols}
 
-def _get_unique_key_name_for_article() -> str:
+def _unique_key_name() -> str:
+    """Return the column that uniquely identifies an Article (url or link)."""
     cols = _model_columns(models.Article)
-    if "url" in cols:
-        return "url"
-    if "link" in cols:
-        return "link"
-    return "url"
+    return "url" if "url" in cols else "link"
 
-def _get_article_by_unique(db: Session, unique_key: str, value: str):
-    col = getattr(models.Article, unique_key)
+def _article_by_unique(db: Session, key: str, value: str) -> Optional[models.Article]:
+    col = getattr(models.Article, key)
     return db.query(models.Article).filter(col == value).one_or_none()
 
 def _domain_from_url(url: str) -> str:
     try:
-        return urlparse(url).netloc.lower().lstrip("www.")
+        return urllib.parse.urlparse(url).netloc.lower().lstrip("www.")
     except Exception:
         return ""
 
-def _get_db_stats(db: Session) -> Dict[str, int]:
-    return {
-        "articles": db.query(func.count(models.Article.id)).scalar() or 0,
-        "mentions": db.query(func.count(models.Mention.id)).scalar() or 0,
-    }
+def _resolve_keywords(req_keywords: Optional[List[str]] = None) -> List[str]:
+    """Fallback chain: request → env var → hard-coded defaults."""
+    if req_keywords:
+        return [k.strip() for k in req_keywords if k.strip()]
 
-# 🔥 FIXED: DYNAMIC KEYWORDS - PRIORITY 1 = PASSED KEYWORDS
-def _resolve_keywords(keywords: Optional[List[str]] = None) -> List[str]:
-    """
-    ✅ DYNAMIC KEYWORDS: Prioritize passed keywords over defaults
-    ✅ KEEPS PHRASES INTACT: "climate change" stays "climate change"
-    ✅ FRONTEND READY: keywords=["climate change", "OpenAI"] → PERFECT!
-    """
-    # 🔥 PRIORITY 1: Use passed keywords (from frontend!)
-    if keywords and len(keywords) > 0:
-        # ✅ PRESERVE PHRASES - don't split on spaces!
-        return [k.strip() for k in keywords if k.strip()]
+    env = os.getenv("INGEST_KEYWORDS", "").strip()
+    if env:
+        return [k.strip() for k in env.split(",") if k.strip()]
 
-    # Priority 2: Environment variable
-    kw_env = (os.getenv("INGEST_KEYWORDS") or "").strip()
-    if kw_env:
-        return [k.strip() for k in kw_env.split(",") if k.strip()]
-
-    # Priority 3: Hardcoded defaults (LAST RESORT)
     return ["AI", "journalism", "startups"]
 
-# Rate Limiting
-def rate_limit(calls_per_minute: int = None):
+# ----------------------------------------------------------------------
+# Rate limiting decorator (simple token-bucket style)
+# ----------------------------------------------------------------------
+def rate_limit(calls_per_minute: int | None = None):
     calls_per_minute = calls_per_minute or config.calls_per_minute
     min_interval = 60.0 / calls_per_minute
     last_called = [0.0]
-    def decorator(func):
-        @wraps(func)
+
+    def decorator(fn):
         def wrapper(*args, **kwargs):
-            elapsed = time.time() - last_called[0]
-            left_to_wait = min_interval - elapsed
-            if left_to_wait > 0:
-                time.sleep(left_to_wait)
-            ret = func(*args, **kwargs)
+            now = time.time()
+            elapsed = now - last_called[0]
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+            ret = fn(*args, **kwargs)
             last_called[0] = time.time()
             return ret
         return wrapper
     return decorator
 
-# RSS Fetching + Parsing
-def _google_news_rss_url(query: str, hl="en-US", gl="US", ceid="US:en") -> str:
+# ----------------------------------------------------------------------
+# RSS fetching & parsing
+# ----------------------------------------------------------------------
+def _google_news_rss_url(query: str, hl: str = "en-US", gl: str = "US", ceid: str = "US:en") -> str:
     q = urllib.parse.quote_plus(query)
     return f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
 
 @rate_limit()
 def _fetch_feed(url: str) -> Optional[feedparser.FeedParserDict]:
     try:
-        resp = requests.get(url, headers={"User-Agent": config.user_agent}, timeout=config.timeout)
-        if resp.status_code != 200:
-            logger.warning(f"Failed to fetch {url}: {resp.status_code}")
-            return None
-        return feedparser.parse(resp.content)
-    except Exception as e:
-        logger.error(f"Error fetching {url}: {e}")
+        r = requests.get(url, headers={"User-Agent": config.user_agent}, timeout=config.timeout)
+        r.raise_for_status()
+        return feedparser.parse(r.content)
+    except Exception as exc:
+        logger.error(f"Failed to fetch {url!r}: {exc}")
         return None
 
 def _parse_published(entry) -> Optional[datetime]:
+    # 1. struct_time from feedparser
     if getattr(entry, "published_parsed", None):
         try:
             ts = entry.published_parsed
@@ -170,11 +169,13 @@ def _parse_published(entry) -> Optional[datetime]:
         except Exception:
             pass
 
+    # 2. RFC-2822 string
     txt = getattr(entry, "published", None) or getattr(entry, "updated", None)
     if txt:
         try:
             from email.utils import parsedate_to_datetime
-            return parsedate_to_datetime(txt).astimezone(timezone.utc)
+            dt = parsedate_to_datetime(txt)
+            return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         except Exception:
             pass
     return None
@@ -184,245 +185,216 @@ def _entry_to_article_dict(entry, unique_key: str) -> Dict[str, Any]:
     link = getattr(entry, "link", "") or ""
     published = _parse_published(entry)
 
+    # Source extraction – Google News wraps original feed inside <source>
     source = ""
     if hasattr(entry, "source"):
         try:
-            if isinstance(entry.source, dict):
-                source = entry.source.get("title") or ""
-            else:
-                source = getattr(entry.source, "title", "") or ""
+            src = entry.source
+            source = src.get("title") if isinstance(src, dict) else getattr(src, "title", "")
         except Exception:
-            source = ""
-
+            pass
     if not source:
         source = _domain_from_url(link)
 
     snippet = getattr(entry, "summary", "") or ""
-
-    return {
+    payload = {
         "title": title,
         "source": source,
         "published": published,
         "raw_text": snippet,
         "fetched_at": _utcnow(),
-    } | {unique_key: link}
+    }
+    payload[unique_key] = link
+    return payload
 
-def _should_include_article(adata: Dict[str, Any], since_utc: datetime) -> bool:
-    published = adata.get("published")
-    content = adata.get("raw_text", "") or adata.get("title", "")
-
-    if published and published < since_utc:
+def _should_include(adata: dict, since_utc: datetime) -> bool:
+    pub = adata.get("published")
+    if pub and pub < since_utc:
         return False
 
-    content_len = len(content.strip())
-    if content_len < config.min_article_length:
+    content = (adata.get("raw_text") or "") + (adata.get("title") or "")
+    if len(content.strip()) < config.min_article_length:
         return False
 
-    skip_phrases = ['read more', 'continue reading', 'loading...', 'advertisement']
-    if any(phrase in content.lower() for phrase in skip_phrases):
+    skip = {"read more", "continue reading", "loading...", "advertisement"}
+    if any(p in content.lower() for p in skip):
         return False
 
     return True
 
-def _fetch_articles_for_keyword(kw: str, per_kw_limit: int, unique_key: str, since_utc: datetime) -> List[Dict[str, Any]]:
-    logger.debug(f"🔍 Fetching articles for keyword: '{kw}'")
-    url = _google_news_rss_url(kw)
-    feed = _fetch_feed(url)
-
-    if not feed or not getattr(feed, "entries", None):
-        logger.warning(f"No entries found for keyword: '{kw}'")
+# ----------------------------------------------------------------------
+# Core fetching logic
+# ----------------------------------------------------------------------
+def _fetch_for_keyword(
+    kw: str,
+    per_kw_limit: int,
+    unique_key: str,
+    since_utc: datetime,
+) -> List[dict]:
+    logger.debug(f"Fetching for keyword: {kw!r}")
+    feed = _fetch_feed(_google_news_rss_url(kw))
+    if not feed or not getattr(feed, "entries", []):
+        logger.warning(f"No entries for keyword {kw!r}")
         return []
 
-    entries = []
-    max_entries = min(per_kw_limit, len(feed.entries))
-    for entry in feed.entries[:max_entries]:
+    collected = []
+    for entry in feed.entries[:per_kw_limit]:
         adata = _entry_to_article_dict(entry, unique_key)
-        if _should_include_article(adata, since_utc):
-            entries.append(adata)
+        if _should_include(adata, since_utc):
+            collected.append(adata)
+    return collected
 
-    logger.debug(f"✅ Found {len(entries)} valid articles for '{kw}'")
-    return entries
-
-# Main Processing Functions
-def _fetch_and_filter_articles(keywords: List[str], limit: int, since_utc: datetime, per_keyword_limit: int) -> List[Dict[str, Any]]:
-    unique_key = _get_unique_key_name_for_article()
-    all_entries = []
+def _fetch_and_filter(
+    keywords: List[str],
+    total_limit: int,
+    since_utc: datetime,
+    per_keyword_limit: int,
+) -> List[dict]:
+    unique_key = _unique_key_name()
+    all_articles: List[dict] = []
 
     for kw in keywords:
-        entries = _fetch_articles_for_keyword(kw, per_keyword_limit, unique_key, since_utc)
-        all_entries.extend(entries)
-
-        if len(all_entries) >= limit:
+        batch = _fetch_for_keyword(kw, per_keyword_limit, unique_key, since_utc)
+        all_articles.extend(batch)
+        if len(all_articles) >= total_limit:
             break
 
-    import random
-    random.shuffle(all_entries)
-    return all_entries[:limit]
+    random.shuffle(all_articles)
+    return all_articles[:total_limit]
 
-def _insert_mention(db: Session, article_id: int, title: str, snippet: str) -> models.Mention:
+# ----------------------------------------------------------------------
+# DB upserts (articles + mentions)
+# ----------------------------------------------------------------------
+def _upsert_article(db: Session, data: dict) -> models.Article:
     """
-    Create a mention with summary, sentiment, and risk score using Azure OpenAI GPT-4o-mini.
+    Insert a new Article or update an existing one.
+    Deduplication is performed on the column returned by ``_unique_key_name()``.
     """
-    content = snippet or title
-    summary = summarize_text(content)[:config.max_summary_length]
-    sentiment, sentiment_score = _analyze_sentiment(content)
-    risk_score_value = risk_score(content, sentiment_score)
-    named_entities = _extract_entities(content)
+    unique_key = _unique_key_name()
+    link = data.get(unique_key)
+    if not link:
+        raise ValueError("Article payload missing unique key")
+
+    existing = _article_by_unique(db, unique_key, link)
+    if existing:
+        # UPDATE path
+        for k, v in data.items():
+            if hasattr(existing, k):
+                setattr(existing, k, v)
+        existing.fetched_at = _utcnow()
+        db.add(existing)
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    # INSERT path
+    article = models.Article(**_filtered_kwargs(data, models.Article))
+    db.add(article)
+    db.commit()
+    db.refresh(article)
+    return article
+
+def _insert_mention(db: Session, article: models.Article) -> models.Mention:
+    content = (article.raw_text or "") + (article.title or "")
+    summary = summarize_text(content)[: config.max_summary_length]
+    sentiment, score = _analyze_sentiment(content)
+    risk = risk_score(content, score)
 
     payload = {
-        "article_id": article_id,
+        "article_id": article.id,
         "summary": summary,
         "sentiment": sentiment,
-        "sentiment_confidence": sentiment_score,  # Maps to your sentiment.py output
-        "risk_score": risk_score_value,
-        "named_entities": named_entities,
+        "risk_score": risk,
+        "named_entities": "(placeholder)",   # replace with real NER later
         "created_at": _utcnow(),
     }
-
-    kwargs = _filtered_kwargs(payload, models.Mention)
-    mention = models.Mention(**kwargs)
+    mention = models.Mention(**_filtered_kwargs(payload, models.Mention))
     db.add(mention)
     return mention
 
-def _process_articles_batch(db: Session, articles: List[Dict[str, Any]], dry_run: bool, stats: IngestStats) -> IngestStats:
-    unique_key = _get_unique_key_name_for_article()
+# ----------------------------------------------------------------------
+# Public entry-point
+# ----------------------------------------------------------------------
+def ingest_google_news(request: IngestRequest, db_url: str) -> IngestStats:
+    """
+    Main ingestion routine.
 
-    for i, adata in enumerate(articles):
-        try:
-            existing = _get_article_by_unique(db, unique_key, adata[unique_key])
-            art = _upsert_article(db, adata)
-            db.flush()
+    * Resolves keywords (request → env → defaults)
+    * Fetches RSS feeds, filters, deduplicates
+    * Upserts Articles + creates a Mention per article
+    * Returns structured stats
+    """
+    engine = create_engine(db_url, future=True)
+    stats = IngestStats()
+    keywords = _resolve_keywords(request.keywords)
+    per_kw = request.per_keyword_limit or config.per_keyword_limit
 
-            if not existing:
-                stats = stats._replace(articles_inserted=stats.articles_inserted + 1)
-            else:
-                stats = stats._replace(articles_updated=stats.articles_updated + 1)
+    articles = _fetch_and_filter(
+        keywords=keywords,
+        total_limit=request.limit,
+        since_utc=request.since_utc,
+        per_keyword_limit=per_kw,
+    )
+    stats = stats._replace(fetched=len(articles), keywords_processed=len(keywords))
 
-            if not dry_run:
-                snippet = adata.get("raw_text", "") or adata.get("title", "")
-                _insert_mention(db, art.id, adata.get("title", ""), snippet)
+    if request.dry_run:
+        logger.info(f"[DRY-RUN] Would process {len(articles)} articles.")
+        return stats
+
+    with engine.begin() as conn:          # one transaction for the whole batch
+        batch = []
+        for adata in articles:
+            try:
+                article = _upsert_article(conn, adata)
+                if not _article_by_unique(conn, _unique_key_name(), adata[_unique_key_name()]):
+                    stats = stats._replace(articles_inserted=stats.articles_inserted + 1)
+                else:
+                    stats = stats._replace(articles_updated=stats.articles_updated + 1)
+
+                mention = _insert_mention(conn, article)
                 stats = stats._replace(mentions_inserted=stats.mentions_inserted + 1)
 
-            if (i + 1) % config.batch_commit_size == 0:
-                db.commit()
-                logger.debug(f"💾 Committed batch at article {i + 1}")
+                batch.append((article, mention))
+                if len(batch) >= config.batch_commit_size:
+                    conn.commit()
+                    batch.clear()
 
-        except Exception as e:
-            logger.error(f"❌ Error processing article {i}: {e}")
-            stats = stats._replace(errors=stats.errors + 1)
-            continue
+            except Exception as exc:
+                logger.error(f"Failed to process article {adata.get('title')!r}: {exc}")
+                stats = stats._replace(errors=stats.errors + 1)
+                conn.rollback()
+                continue
 
+        # final commit for remaining items
+        if batch:
+            conn.commit()
+
+    logger.info(
+        f"Ingestion complete → inserted {stats.articles_inserted}, "
+        f"updated {stats.articles_updated}, mentions {stats.mentions_inserted}, "
+        f"errors {stats.errors}"
+    )
     return stats
 
-def _format_results(stats: IngestStats, before_stats: Dict[str, int], after_stats: Dict[str, int], dry_run: bool, keywords: List[str]) -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "mode": "google",
-        "dry_run": dry_run,
-        "keywords": keywords,
-        "stats": stats._asdict(),
-        "counts_before": before_stats,
-        "counts_after": after_stats,
-        "summary": {
-            "total_articles": after_stats["articles"],
-            "total_mentions": after_stats["mentions"],
-            "new_articles": stats.articles_inserted,
-            "new_mentions": stats.mentions_inserted,
-        }
-    }
-
-# Public Entrypoint
-def run_ingest(
-    db: Session,
-    source: str,
-    limit: int,
-    since_utc: datetime,
-    dry_run: bool = False,
-    keywords: Optional[List[str]] = None,
-    per_keyword_limit: Optional[int] = None,
-) -> Dict[str, Any]:
-    if source.lower() != "google":
-        return {"status": "error", "message": "Only 'google' source is supported"}
-
-    try:
-        req = IngestRequest(
-            source=source, limit=limit, since_utc=since_utc,
-            dry_run=dry_run, keywords=keywords, per_keyword_limit=per_keyword_limit
-        )
-    except ValueError as e:
-        return {"status": "error", "message": f"Validation error: {e}"}
-
-    if per_keyword_limit:
-        config.per_keyword_limit = per_keyword_limit
-
-    stats = IngestStats()
-    keywords = _resolve_keywords(keywords)
-
-    logger.info(f"🚀 Starting ingestion: source={source}, limit={limit}, keywords={keywords[:3]}{'...' if len(keywords) > 3 else ''}")
-
-    try:
-        before_stats = _get_db_stats(db)
-        stats = stats._replace(keywords_processed=len(keywords))
-
-        articles = _fetch_and_filter_articles(
-            keywords, limit, since_utc, config.per_keyword_limit
-        )
-        stats = stats._replace(fetched=len(articles))
-
-        logger.info(f"📊 Fetched {len(articles)} articles from {len(keywords)} keywords")
-
-        if dry_run:
-            return _format_results(stats, before_stats, before_stats, True, keywords)
-
-        stats = _process_articles_batch(db, articles, False, stats)
-
-        db.commit()
-        after_stats = _get_db_stats(db)
-
-        logger.info(f"✅ Ingestion complete: {stats.articles_inserted} new articles, {stats.mentions_inserted} mentions")
-
-        return _format_results(stats, before_stats, after_stats, False, keywords)
-
-    except Exception as e:
-        logger.error(f"💥 Ingestion failed: {e}", exc_info=True)
-        db.rollback()
-        return {
-            "status": "error",
-            "message": f"{e.__class__.__name__}: {str(e)}",
-            "stats": stats._asdict()
-        }
-
-# 🔥 FRONTEND READY: Dynamic recent ingestion
-def run_recent_ingest(db: Session, limit: int = 50, hours_back: int = 24, **kwargs) -> Dict[str, Any]:
-    """
-    🚀 FRONTEND PERFECT: Dynamic recent ingestion by user keywords
-    Usage: run_recent_ingest(db, keywords=["climate change", "OpenAI"], per_keyword_limit=5)
-    """
-    since_utc = _utcnow() - timedelta(hours=hours_back)
-    return run_ingest(db, "google", limit, since_utc, **kwargs)
-
+# ----------------------------------------------------------------------
+# Example CLI (optional – useful for local testing or Azure startup script)
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
-    from sqlalchemy.orm import sessionmaker
-    from sqlalchemy import create_engine
+    import argparse
+    from datetime import timedelta
 
-    # 🔥 TEST DYNAMIC KEYWORDS (Replace with your Azure connection string)
-    azure_conn_string = "postgresql+psycopg2://username:password@your-azure-server.postgres.database.azure.com:5432/yourdb?sslmode=require"
-    engine = create_engine(azure_conn_string)
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    db = SessionLocal()
+    parser = argparse.ArgumentParser(description="Google News → DB ingester")
+    parser.add_argument("--db", required=True, help="SQLAlchemy DB URL")
+    parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--hours", type=int, default=6, help="Look-back window in hours")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
 
-    # ✅ TEST 1: Dynamic keywords (FRONTEND SIMULATION)
-    print("🔥 TESTING DYNAMIC KEYWORDS...")
-    result1 = run_recent_ingest(
-        db,
-        limit=10,
-        keywords=["climate change", "OpenAI", "xAI"],  # ✅ PHRASES PRESERVED!
-        per_keyword_limit=3
+    req = IngestRequest(
+        source="google_news",
+        limit=args.limit,
+        since_utc=_utcnow() - timedelta(hours=args.hours),
+        dry_run=args.dry_run,
     )
-    print("✅ RESULT:", result1.get("keywords", "No keywords"), "→", result1.get("status"))
-
-    # ✅ TEST 2: Single keyword
-    result2 = run_recent_ingest(db, limit=5, keywords=["AI"])
-    print("✅ SINGLE:", result2.get("keywords", "No keywords"), "→", result2.get("status"))
-
-    db.close()
+    stats = ingest_google_news(req, args.db)
+    print(stats._asdict())
