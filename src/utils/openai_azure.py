@@ -1,11 +1,9 @@
-# src/utils/openai_azure.py
 import os
 import requests
 import logging
 
 logger = logging.getLogger(__name__)
 
-# Environment
 ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 KEY = os.getenv("AZURE_OPENAI_KEY")
 API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
@@ -15,7 +13,7 @@ EMBED_DEPLOY = os.getenv("AZURE_OPENAI_EMBED_DEPLOYMENT", "text-embedding-3-smal
 def chat(messages, model: str = None, temperature: float = 0.2):
     """
     Chat completion using Azure OpenAI REST API.
-    Compatible with summarizer.py calls that pass model=<deployment>.
+    Accepts optional `model` for compatibility with summarizer.py.
     """
     if not ENDPOINT or not KEY:
         logger.warning("Azure OpenAI not configured.")
@@ -23,10 +21,10 @@ def chat(messages, model: str = None, temperature: float = 0.2):
 
     deploy = model or CHAT_DEPLOY
     url = f"{ENDPOINT}/openai/deployments/{deploy}/chat/completions?api-version={API_VERSION}"
-
     headers = {"api-key": KEY, "Content-Type": "application/json"}
+
     body = {
-        "model": deploy,               # ✅ added model for Azure compatibility
+        "model": deploy,                # ✅ required by REST API
         "messages": messages,
         "temperature": temperature,
         "max_tokens": 300,
@@ -42,14 +40,18 @@ def chat(messages, model: str = None, temperature: float = 0.2):
         return ""
 
 def embed(texts):
-    """Get embeddings via Azure OpenAI REST API."""
+    """Return embeddings via Azure OpenAI REST API."""
     if not ENDPOINT or not KEY:
         logger.warning("Azure OpenAI not configured.")
         return []
 
     url = f"{ENDPOINT}/openai/deployments/{EMBED_DEPLOY}/embeddings?api-version={API_VERSION}"
     headers = {"api-key": KEY, "Content-Type": "application/json"}
-    body = {"model": EMBED_DEPLOY, "input": texts}
+
+    body = {
+        "model": EMBED_DEPLOY,          # ✅ required by REST API
+        "input": texts,
+    }
 
     try:
         r = requests.post(url, headers=headers, json=body, timeout=60)
