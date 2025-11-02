@@ -270,6 +270,8 @@ def ingest_google_news(source: str, keywords: List[str], db_url: str, limit: int
     if dry_run or not articles:
         return {"status": "ok", "message": "Dry run or no articles found", "stats": stats._asdict()}
 
+    logger.info(f"🔗 Connecting to DB: {db_url}")
+
     engine = create_engine(db_url, pool_pre_ping=True, pool_size=5, max_overflow=10, future=True)
     SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     db = SessionLocal()
@@ -307,9 +309,11 @@ def run_ingest(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Used by /api/ingest"""
-    engine = db.get_bind()
-    db_url = str(engine.url)
+    db_url = os.getenv("DATABASE_URL")  # ✅ Use encoded env var directly
+    if not db_url:
+        raise RuntimeError("DATABASE_URL not set in environment.")
     kw = _resolve_keywords(keywords)
+    logger.info(f"[run_ingest] Using DB URL: {db_url}")
     return ingest_google_news(source, kw, db_url, limit, since_utc, per_keyword_limit, dry_run)
 
 
@@ -322,10 +326,12 @@ def run_recent_ingest(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Used by /api/ingest/params"""
-    engine = db.get_bind()
-    db_url = str(engine.url)
+    db_url = os.getenv("DATABASE_URL")  # ✅ Use encoded env var directly
+    if not db_url:
+        raise RuntimeError("DATABASE_URL not set in environment.")
     since_utc = _utcnow() - timedelta(hours=hours_back)
     kw = _resolve_keywords(keywords)
+    logger.info(f"[run_recent_ingest] Using DB URL: {db_url}")
     return ingest_google_news("google", kw, db_url, limit, since_utc, per_keyword_limit, dry_run)
 
 
